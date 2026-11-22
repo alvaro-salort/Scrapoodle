@@ -1,7 +1,13 @@
 import json
+from argparse import Namespace
+from unittest.mock import MagicMock
 
+from moodle_scraper.cli import MoodleCLI
+from moodle_scraper.config import ScraperConfig
+from moodle_scraper.course_scraper import CourseProcessingStats
 from moodle_scraper.eventos import BusEventos, Evento
 from moodle_scraper.observadores import ObservadorReporteJSON
+from moodle_scraper.parser import Course
 
 
 class ObservadorDePrueba:
@@ -68,3 +74,22 @@ def test_reporte_json_escribe_una_linea_por_evento(tmp_path):
     assert primero["datos"]["curso"] == "Base de Datos"
     assert segundo["tipo"] == "descarga_completada"
     assert segundo["datos"]["archivo"] == "clase.pdf"
+
+
+def test_cli_suscribe_el_reporte_json(tmp_path):
+    config = ScraperConfig(
+        user="usuario",
+        password="secreto",
+        base_url="https://moodle.test/moodle/",
+    )
+    cli = MoodleCLI(config)
+    cli.session.login = MagicMock(return_value=True)
+    cli.discover_enrolled_courses = MagicMock(return_value=[Course(id="1", name="Curso")])
+    cli._select_courses = MagicMock(return_value=[Course(id="1", name="Curso")])
+    cli.course_scraper.process_course = MagicMock(return_value=CourseProcessingStats())
+
+    ruta = tmp_path / "eventos.json"
+    assert cli.run(Namespace(reporte_json=str(ruta))) == 0
+
+    cli.bus_eventos.publicar(Evento("log", {"nivel": "info", "mensaje": "prueba de reporte"}))
+    assert "prueba de reporte" in ruta.read_text(encoding="utf-8")

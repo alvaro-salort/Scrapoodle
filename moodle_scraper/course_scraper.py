@@ -4,7 +4,7 @@ Orquestador de Procesamiento de Curso: Extrae contenidos, teoría, páginas y de
 
 import asyncio
 import hashlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
@@ -15,12 +15,14 @@ from selectolax.lexbor import LexborHTMLParser
 
 from moodle_scraper.config import ScraperConfig
 from moodle_scraper.downloader import Downloader
+from moodle_scraper.eventos import Evento
+from moodle_scraper.observadores import crear_bus_por_defecto
 from moodle_scraper.integrity import check_directory, write_report
 from moodle_scraper.markdown_writer import CourseMarkdownWriter, extract_image_source
 from moodle_scraper.manifest import RunManifest
 from moodle_scraper.parser import Course, CourseSection, CourseModule, FileItem, MoodleParser
 from moodle_scraper.session import MoodleSession, MoodleAuthError
-from moodle_scraper.utils import Logger, sanitize_filename, make_absolute_url
+from moodle_scraper.utils import sanitize_filename, make_absolute_url
 
 
 def _run_async(coro):
@@ -73,10 +75,17 @@ class _DownloadJob:
 class CourseScraper:
     """Maneja la extracción completa de un curso específico."""
 
-    def __init__(self, session: MoodleSession, config: ScraperConfig):
+    def __init__(self, session: MoodleSession, config: ScraperConfig, bus_eventos=None):
         self.session = session
         self.config = config
-        self.downloader = Downloader(session, config)
+        self.bus_eventos = bus_eventos or crear_bus_por_defecto()
+        self.downloader = Downloader(session, config, bus_eventos=self.bus_eventos)
+
+    def _emitir(self, tipo: str, **datos) -> None:
+        self.bus_eventos.publicar(Evento(tipo, datos))
+
+    def _log(self, nivel: str, mensaje: str) -> None:
+        self._emitir("log", nivel=nivel, mensaje=mensaje)
 
     def process_course(self, course: Course, course_index: int = 0, total_courses: int = 0) -> CourseProcessingStats:
         """
@@ -88,14 +97,13 @@ class CourseScraper:
         course_view_url = course.url or make_absolute_url(
             self.config.base_url, f"course/view.php?id={course.id}"
         )
-        Logger.course_header(course.name, course_index, total_courses)
+        self._emitir("curso_iniciado", curso=course.name, indice=course_index, total=total_courses)
 
         # 1. Crear carpeta raíz del curso
         course_dir = self.config.download_dir / course.sanitized_name
         course_dir.mkdir(parents=True, exist_ok=True)
         manifest = RunManifest(course_dir, course.id, course.name)
-        Logger.info(f"Directorio local del curso: {course_dir}")
-
+        self._log("info", f"Directorio local del curso: {course_dir}")
         sections: List[CourseSection] = []
 
         # 2. Estrategia A: API AJAX de Moodle (core_course_get_contents) con sesskey
@@ -115,12 +123,11 @@ class CourseScraper:
                     sections = MoodleParser.parse_course_contents_from_ajax(ajax_data, self.config.base_url)
                     if sections:
                         total_mods = sum(len(s.modules) for s in sections)
-                        Logger.success(f"Estructura completa obtenida vía API Moodle ({len(sections)} secciones, {total_mods} actividades/recursos)")
+                        self._log("success", f"Estructura completa obtenida vía API Moodle ({len(sections)} secciones, {total_mods} actividades/recursos)")
             except MoodleAuthError:
                 raise
             except Exception as e:
-                Logger.warn(f"No se pudo consultar el servicio AJAX de contenidos: {e}")
-
+                self._log("warn", f"No se pudo consultar el servicio AJAX de contenidos: {e}")
         # 3. Estrategia B: Mapeo y Crawling HTML (soporte para pestañas onetopic, sub-páginas y secciones estándar)
         if not sections:
             try:
@@ -128,18 +135,19 @@ class CourseScraper:
                 resp.raise_for_status()
                 course_html = resp.text
             except (httpx.RequestError, Exception) as e:
-                Logger.error(f"No se pudo cargar el curso {course.name} ({course_view_url}): {e}")
+                self._log("error", f"No se pudo cargar el curso {course.name} ({course_view_url}): {e}")
+                self._emitir("curso_finalizado", curso=course.name, stats=asdict(stats), error=True)
                 return stats
 
             # Caso 1: Formato Onetopic (árbol jerárquico de pestañas y subtemas)
             if MoodleParser.is_onetopic_course(course_html):
-                Logger.info("Formato Onetopic (árbol de pestañas y subtemas) detectado.")
+                self._log("info", "Formato Onetopic (árbol de pestañas y subtemas) detectado.")
                 l0_tabs = MoodleParser.extract_onetopic_level_0_tabs(course_html, self.config.base_url, course.id)
                 seen_sec_ids = set()
 
                 for l0 in l0_tabs:
                     if l0.get("disabled"):
-                        Logger.info(f"Pestaña oculta o no disponible omitida: {l0.get('title')}")
+                        self._log("info", f"Pestaña oculta o no disponible omitida: {l0.get('title')}")
                         continue
 
                     # Si la pestaña raíz no tiene hijos, se procesa directamente
@@ -161,11 +169,11 @@ class CourseScraper:
                         except MoodleAuthError:
                             raise
                         except Exception as e:
-                            Logger.warn(f"No se pudo cargar pestaña {l0.get('title')}: {e}")
+                            self._log("warn", f"No se pudo cargar pestaña {l0.get('title')}: {e}")
                     else:
                         # Si tiene subpestañas (ej: Módulo I -> Clase 1, Clase 2...)
                         parent_title = l0.get("title", "")
-                        Logger.info(f"Explorando subpestañas de: {parent_title}")
+                        self._log("info", f"Explorando subpestañas de: {parent_title}")
                         try:
                             parent_resp = self.session.get(l0["url"])
                             if parent_resp.status_code == 200:
@@ -198,17 +206,16 @@ class CourseScraper:
                                     except MoodleAuthError:
                                         raise
                                     except Exception as e:
-                                        Logger.warn(f"No se pudo cargar subtema {parent_title} > {l1.title}: {e}")
+                                        self._log("warn", f"No se pudo cargar subtema {parent_title} > {l1.title}: {e}")
                         except MoodleAuthError:
                             raise
                         except Exception as e:
-                            Logger.warn(f"No se pudo cargar pestaña padre {parent_title}: {e}")
-
+                            self._log("warn", f"No se pudo cargar pestaña padre {parent_title}: {e}")
             # Caso 2: Pestañas estándar multipágina o secciones en una sola página
             else:
                 tab_links = MoodleParser.extract_section_links_from_html(course_html, self.config.base_url, course.id)
                 if len(tab_links) > 1:
-                    Logger.info(f"Formato multi-sección detectado: {len(tab_links)} pestañas encontradas.")
+                    self._log("info", f"Formato multi-sección detectado: {len(tab_links)} pestañas encontradas.")
                     seen_sec_ids = set()
                     for sec_num, sec_title, tab_url in tab_links:
                         try:
@@ -227,18 +234,17 @@ class CourseScraper:
                         except MoodleAuthError:
                             raise
                         except Exception as e:
-                            Logger.warn(f"No se pudo cargar pestaña {sec_title} ({tab_url}): {e}")
+                            self._log("warn", f"No se pudo cargar pestaña {sec_title} ({tab_url}): {e}")
                 else:
                     sections = MoodleParser.parse_course_sections(course_html, self.config.base_url)
 
         stats.sections_count = len(sections)
-        Logger.info(f"Secciones totales a procesar: {len(sections)}")
-
+        self._log("info", f"Secciones totales a procesar: {len(sections)}")
         # 4. Procesar actividades y preparar las descargas de cada sección
         section_jobs: List[Tuple[CourseSection, Path, List[_DownloadJob]]] = []
         for sec in sections:
             sec_display = f"{sec.parent_name} > {sec.name}" if sec.parent_name else sec.name
-            Logger.section(sec_display)
+            self._emitir("seccion_iniciada", nombre=sec_display)
             sec_dir = course_dir / sec.relative_folder_path
             sec_dir.mkdir(parents=True, exist_ok=True)
 
@@ -278,15 +284,16 @@ class CourseScraper:
         report_path = write_report(course_dir, link_issues)
         stats.links_broken = len(link_issues)
         if link_issues:
-            Logger.warn(
+            self._log(
+                "warn",
                 f"Verificación de enlaces: {len(link_issues)} referencia(s) rota(s). "
-                f"Ver {report_path.name}"
+                f"Ver {report_path.name}",
             )
         else:
-            Logger.success("Verificación de enlaces: todas las referencias locales existen.")
-
+            self._log("success", "Verificación de enlaces: todas las referencias locales existen.")
         # 8. Reporte de resumen del curso
-        Logger.info(
+        self._log(
+            "info",
             f"Resumen de curso '{course.name}': "
             f"{stats.files_downloaded} descargados, "
             f"{stats.files_skipped} omitidos/existentes, "
@@ -294,8 +301,9 @@ class CourseScraper:
             f"{stats.images_downloaded} imágenes descargadas "
             f"({stats.images_skipped} omitidas, {stats.images_failed} fallidas), "
             f"{stats.links_broken} enlaces rotos, "
-            f"{stats.pages_extracted} páginas de teoría procesadas."
+            f"{stats.pages_extracted} páginas de teoría procesadas.",
         )
+        self._emitir("curso_finalizado", curso=course.name, stats=asdict(stats))
         return stats
 
     def _download_course_images(
@@ -328,7 +336,7 @@ class CourseScraper:
                 if parsed.scheme not in ("http", "https"):
                     continue
                 if parsed.netloc != base_netloc:
-                    Logger.info(f"Imagen externa omitida: {absolute_url}")
+                    self._log("info", f"Imagen externa omitida: {absolute_url}")
                     continue
 
                 alt = (image.attributes or {}).get("alt", "") or "imagen"
@@ -385,7 +393,7 @@ class CourseScraper:
                     auth_error = mae
                 except Exception as e:
                     stats.images_failed += 1
-                    Logger.error(f"Error inesperado al descargar imagen: {e}")
+                    self._log("error", f"Error inesperado al descargar imagen: {e}")
             if auth_error:
                 raise auth_error
             return results
@@ -404,8 +412,7 @@ class CourseScraper:
                     stats.images_downloaded += 1
             else:
                 stats.images_failed += 1
-                Logger.warn(f"No se pudo descargar la imagen embebida: {image_url}")
-
+                self._log("warn", f"No se pudo descargar la imagen embebida: {image_url}")
         return image_paths
 
     def _collect_module_jobs(
@@ -427,12 +434,11 @@ class CourseScraper:
                     mod.content_html = page_data.get("html", "")
                     mod.content_text = page_data.get("text", "")
                     stats.pages_extracted += 1
-                    Logger.info(f"Página teórica extraída: {mod.name}")
+                    self._log("info", f"Página teórica extraída: {mod.name}")
             except MoodleAuthError:
                 raise
             except Exception as e:
-                Logger.warn(f"No se pudo obtener el contenido de la página {mod.name}: {e}")
-
+                self._log("warn", f"No se pudo obtener el contenido de la página {mod.name}: {e}")
         # B) Enlaces externos (/mod/url/view.php)
         elif mod.mod_type == "url" and mod.url and not mod.external_url:
             try:
@@ -441,12 +447,11 @@ class CourseScraper:
                     ext_url = MoodleParser.parse_external_url(url_resp.text)
                     if ext_url:
                         mod.external_url = ext_url
-                        Logger.info(f"Enlace externo resuelto: {mod.name} -> {ext_url}")
+                        self._log("info", f"Enlace externo resuelto: {mod.name} -> {ext_url}")
             except MoodleAuthError:
                 raise
             except Exception as e:
-                Logger.warn(f"No se pudo resolver URL externa {mod.name}: {e}")
-
+                self._log("warn", f"No se pudo resolver URL externa {mod.name}: {e}")
         # C) Carpetas con múltiples archivos (/mod/folder/view.php)
         elif mod.mod_type == "folder" and mod.url and not mod.files:
             try:
@@ -462,8 +467,7 @@ class CourseScraper:
             except MoodleAuthError:
                 raise
             except Exception as e:
-                Logger.error(f"Error procesando carpeta {mod.name}: {e}")
-
+                self._log("error", f"Error procesando carpeta {mod.name}: {e}")
         # D) Recursos directos descargables (/mod/resource/view.php) sin archivos listados
         elif mod.mod_type == "resource" and mod.url and not mod.files:
             jobs.append(_DownloadJob(
@@ -478,8 +482,7 @@ class CourseScraper:
 
         # E) Actividades de entrega / Tareas (/mod/assign/view.php)
         elif mod.mod_type == "assign":
-            Logger.info(f"Actividad de entrega detectada: {mod.name}")
-
+            self._log("info", f"Actividad de entrega detectada: {mod.name}")
         # F) Descargar archivos adjuntos / contenidos directos detectados
         for f in mod.files:
             if f.url:
@@ -579,7 +582,7 @@ class CourseScraper:
                     auth_error = mae
                 except Exception as e:
                     stats.files_failed += 1
-                    Logger.error(f"Error inesperado en descarga concurrente: {e}")
+                    self._log("error", f"Error inesperado en descarga concurrente: {e}")
             if auth_error:
                 raise auth_error
             return results

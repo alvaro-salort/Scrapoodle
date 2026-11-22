@@ -172,6 +172,7 @@ python main.py --filter "Hardware"
 - `--overwrite`: Fuerza la sobreescritura de archivos locales existentes.
 - `--env "ruta/a/otro.env"`: Carga un archivo `.env` específico.
 - `--conf "ruta/a/config.ini"`: Carga un archivo INI específico.
+- `--reporte-json [RUTA]`: Guarda los eventos del scraper en JSON Lines. Sin ruta usa `downloads/reporte_eventos.json`.
 
 ### 6. Verificar Enlaces Locales
 Comprueba que todos los enlaces a archivos e imágenes de un árbol de descargas apunten a archivos existentes, sin necesidad de iniciar sesión:
@@ -200,6 +201,24 @@ Las descargas rechazan HTML inesperado (por ejemplo, la página de login) y veri
 ---
 
 ---
+
+## Eventos y observadores
+
+El pipeline de cada curso publica eventos en un `BusEventos`. La consola y la mascota Poodle son observadores; el scraper no las conoce.
+
+```bash
+python main.py --reporte-json
+python main.py --reporte-json ./reporte_eventos.json
+python main.py --no-pet --reporte-json
+```
+
+El reporte JSON guarda una línea por evento, por ejemplo:
+
+```json
+{"tipo": "descarga_completada", "momento": "2026-11-22T21:10:03+00:00", "datos": {"archivo": "clase.pdf", "tamano": "2.31 MB"}}
+```
+
+La explicación del refactor, los eventos y los costos del patrón están en [`docs/observer.md`](docs/observer.md).
 
 ## 🧪 Ejecución de Pruebas Unitarias
 
@@ -236,8 +255,13 @@ Moodle Scraper/
 │   ├── downloader.py            # Descargador streaming 8KB, Content-Disposition y deduplicación
 │   ├── markdown_writer.py       # Conversor HTML->Markdown y creador de teoría
 │   ├── course_scraper.py        # Orquestador por curso (secciones, páginas, recursos)
+│   ├── eventos.py               # Evento, observadores y BusEventos
+│   ├── observadores.py          # Consola, Poodle y reporte JSON
 │   ├── cli.py                   # Menú interactivo y selección por consola
 │   └── utils.py                 # Sanitización Windows/Linux, Logger coloreado y helpers
+├── docs/
+│   └── observer.md              # Refactor Observer, eventos y comparación
+
 └── tests/                       # Suite de pruebas unitarias
     ├── test_utils.py
     ├── test_parser.py

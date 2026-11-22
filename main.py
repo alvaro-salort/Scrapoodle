@@ -9,6 +9,7 @@ Uso:
     python main.py --course-id 1234    # Descargar un curso específico por ID
     python main.py --filter "Algebra"  # Filtrar cursos por nombre
     python main.py --no-pet            # Ejecutar en modo CLI clásico sin animación
+    python main.py --reporte-json      # Guardar eventos en downloads/reporte_eventos.json
 """
 
 import argparse
@@ -121,6 +122,14 @@ def parse_arguments() -> argparse.Namespace:
         metavar="DIR",
         default=None,
         help="Verifica tamaño y SHA-256 de los archivos registrados en los manifest.json (no requiere login)"
+    )
+    parser.add_argument(
+        "--reporte-json",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="RUTA",
+        help="Guarda los eventos del scraper en JSON Lines (por defecto downloads/reporte_eventos.json)"
     )
 
     return parser.parse_args()

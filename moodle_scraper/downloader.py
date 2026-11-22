@@ -13,9 +13,11 @@ from typing import Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from moodle_scraper.config import ScraperConfig
+from moodle_scraper.eventos import Evento
 from moodle_scraper.manifest import sha256_file
+from moodle_scraper.observadores import crear_bus_por_defecto
 from moodle_scraper.session import MoodleSession, MoodleAuthError
-from moodle_scraper.utils import Logger, sanitize_filename, format_bytes
+from moodle_scraper.utils import sanitize_filename, format_bytes
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".avif"}
 
@@ -49,9 +51,13 @@ class _DownloadIncomplete(Exception):
 class Downloader:
     """Administra la descarga de archivos y recursos multimedia de Moodle con httpx y hishel."""
 
-    def __init__(self, session: MoodleSession, config: ScraperConfig):
+    def __init__(self, session: MoodleSession, config: ScraperConfig, bus_eventos=None):
         self.session = session
         self.config = config
+        self.bus_eventos = bus_eventos or crear_bus_por_defecto()
+
+    def _emitir(self, tipo: str, **datos) -> None:
+        self.bus_eventos.publicar(Evento(tipo, datos))
 
     def extract_filename_from_headers(self, response) -> Optional[str]:
         """Extrae el nombre de archivo desde Content-Disposition (RFC 5987 / RFC 2616)."""
@@ -151,7 +157,7 @@ class Downloader:
         except MoodleAuthError:
             raise
         except Exception as e:
-            Logger.error(f"Fallo al solicitar descarga de {url}: {e}")
+            self._emitir("log", nivel="error", mensaje=f"Fallo al solicitar descarga de {url}: {e}")
             return False, None, f"Error de red: {e}"
 
         if isinstance(self.session, MoodleSession) and self.session.is_login_response(response):
@@ -164,7 +170,7 @@ class Downloader:
         if not self._is_content_type_allowed(content_type, url, allowed_content_prefix):
             if hasattr(response, "close"):
                 response.close()
-            Logger.warn(f"Descarga omitida por tipo de contenido no permitido ({content_type or 'desconocido'}): {url}")
+            self._emitir("log", nivel="warn", mensaje=f"Descarga omitida por tipo de contenido no permitido ({content_type or 'desconocido'}): {url}")
             return False, None, f"Tipo de contenido no permitido: {content_type or 'desconocido'}"
 
         filename = self.resolve_filename(response, fallback_name)
@@ -180,7 +186,7 @@ class Downloader:
         ):
             if hasattr(response, "close"):
                 response.close()
-            Logger.warn(f"Se recibió HTML en lugar de un archivo descargable: {url}")
+            self._emitir("log", nivel="warn", mensaje=f"Se recibió HTML en lugar de un archivo descargable: {url}")
             return False, None, "La respuesta es HTML y no un archivo descargable (¿sesión expirada?)"
 
         cl_header = response.headers.get("Content-Length") if hasattr(response, "headers") else None
@@ -190,14 +196,14 @@ class Downloader:
         if max_bytes is not None and total_bytes is not None and total_bytes > max_bytes:
             if hasattr(response, "close"):
                 response.close()
-            Logger.warn(f"Descarga omitida por tamaño excesivo ({format_bytes(total_bytes)} > {format_bytes(max_bytes)}): {url}")
+            self._emitir("log", nivel="warn", mensaje=f"Descarga omitida por tamaño excesivo ({format_bytes(total_bytes)} > {format_bytes(max_bytes)}): {url}")
             return False, None, f"El archivo excede el tamaño máximo permitido ({format_bytes(max_bytes)})"
 
         # Anti-Duplicados
         if target_path.exists() and not self.config.overwrite_existing:
             local_size = target_path.stat().st_size
             if (total_bytes and local_size == total_bytes) or (not total_bytes and local_size > 0):
-                Logger.skip(f"{filename} ({format_bytes(local_size)}) ya existe.")
+                self._emitir("descarga_omitida", archivo=filename, tamano=format_bytes(local_size))
                 if hasattr(response, "close"):
                     response.close()
                 if metadata_out is not None:
@@ -213,7 +219,7 @@ class Downloader:
         hasher = hashlib.sha256() if metadata_out is not None else None
 
         info_tag = f" [{source_info}]" if source_info else ""
-        Logger.info(f"Descargando: {filename}{info_tag} ({formatted_total})...")
+        self._emitir("descarga_iniciada", archivo=filename, info=info_tag, total=formatted_total)
 
         try:
             with open(temp_path, "wb") as f:
@@ -243,7 +249,7 @@ class Downloader:
                     target_path.unlink()
                 temp_path.rename(target_path)
 
-            Logger.success(f"Descargado: {filename} ({format_bytes(downloaded_bytes)})")
+            self._emitir("descarga_completada", archivo=filename, tamano=format_bytes(downloaded_bytes))
             if metadata_out is not None:
                 metadata_out.update({
                     "url": url,
@@ -258,7 +264,7 @@ class Downloader:
                     temp_path.unlink()
                 except Exception:
                     pass
-            Logger.error(f"Fallo en descarga: {e}: {url}")
+            self._emitir("descarga_fallida", archivo=filename, url=url, error=str(e), mensaje=f"Fallo en descarga: {e}: {url}")
             return False, None, str(e)
         except Exception as e:
             if temp_path.exists():
@@ -266,7 +272,7 @@ class Downloader:
                     temp_path.unlink()
                 except Exception:
                     pass
-            Logger.error(f"Error al escribir {filename}: {e}")
+            self._emitir("descarga_fallida", archivo=filename, url=url, error=f"Error de escritura: {e}", mensaje=f"Error al escribir {filename}: {e}")
             return False, None, f"Error de escritura: {e}"
         finally:
             if hasattr(response, "close"):

@@ -6,10 +6,12 @@ Permite descubrir cursos, seleccionar interactivamente o procesar en lote con la
 import argparse
 import sys
 import time
+from pathlib import Path
 from typing import List, Optional
 from moodle_scraper.config import ScraperConfig, prompt_retry_credentials
 from moodle_scraper.course_scraper import CourseScraper, CourseProcessingStats
 from moodle_scraper.course_selector import CourseSelection, CourseSelector
+from moodle_scraper.observadores import ObservadorReporteJSON, crear_bus_por_defecto
 from moodle_scraper.parser import Course, MoodleParser
 from moodle_scraper.session import MoodleSession, MoodleAuthError
 from moodle_scraper.utils import Logger, Colors, _safe_print, console, _log_lock
@@ -22,7 +24,8 @@ class MoodleCLI:
     def __init__(self, config: ScraperConfig):
         self.config = config
         self.session = MoodleSession(config)
-        self.course_scraper = CourseScraper(self.session, config)
+        self.bus_eventos = crear_bus_por_defecto()
+        self.course_scraper = CourseScraper(self.session, config, bus_eventos=self.bus_eventos)
         self.course_selector = CourseSelector(config.base_url)
         self.discovered_courses: List[Course] = []
 
@@ -40,6 +43,12 @@ class MoodleCLI:
                 Logger.error(err)
             Logger.warn("Por favor configure sus credenciales en el archivo .env o scraper.conf")
             return 1
+
+        reporte = getattr(args, "reporte_json", None) if args else None
+        if reporte:
+            ruta_reporte = Path(reporte) if isinstance(reporte, str) else self.config.download_dir / "reporte_eventos.json"
+            self.bus_eventos.suscribir(ObservadorReporteJSON(ruta_reporte))
+            Logger.info(f"Reporte de eventos: {ruta_reporte}")
 
         # 1. Autenticación (con opción de reintentar contraseña si las credenciales son inválidas)
         while True:

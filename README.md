@@ -42,7 +42,7 @@ Flags: `--workers N`, `--delay S`, `--overwrite`, `--download-dir DIR`, `--env R
 
 La consola incluye la mascota Poodle. `--no-pet` la desactiva.
 
-![Salida de python main.py --help](docs/cli.png)
+<img width="989" height="539" alt="scrapoodle" src="https://github.com/user-attachments/assets/aa2f6156-b6e2-4283-8416-305c7d8a6483" />
 
 ## Salida
 

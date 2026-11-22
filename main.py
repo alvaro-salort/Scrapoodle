@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 """
-Punto de Entrada Principal del Scraper de Moodle ITU UNCUYO.
+Scrapoodle: Scraper automatizado de Moodle 4.x (ITU UNCUYO).
+Descarga recursos, documentos y extrae teoría a Markdown con mascota interactiva.
+
 Uso:
-    python main.py                     # Modo interactivo
+    python main.py                     # Modo interactivo con mascota Poodle
     python main.py --all               # Descargar todos los cursos automáticamente
     python main.py --course-id 1234    # Descargar un curso específico por ID
     python main.py --filter "Algebra"  # Filtrar cursos por nombre
+    python main.py --no-pet            # Ejecutar en modo CLI clásico sin animación
 """
 
 import argparse
 import sys
 from pathlib import Path
+
+# Configurar UTF-8 nativo en terminales Windows
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from moodle_scraper.config import (
     load_config,
@@ -20,12 +33,14 @@ from moodle_scraper.config import (
 from moodle_scraper.cli import MoodleCLI
 from moodle_scraper.integrity import check_directory, write_report
 from moodle_scraper.manifest import verify_directory
+from moodle_scraper.poodle import PoodleUI
 from moodle_scraper.utils import Logger
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scraper automatizado de Moodle 4.x (ITU UNCUYO): Recursos, documentos y teoría en Markdown.",
+        prog="scrapoodle",
+        description="Scrapoodle: Scraper automatizado de Moodle 4.x (ITU UNCUYO) con extracción de teoría a Markdown.",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
@@ -87,6 +102,11 @@ def parse_arguments() -> argparse.Namespace:
             "Preferí MOODLE_SESSION_COOKIE o el prompt interactivo; "
             "usá '-' para leerla por stdin sin dejarla en el historial."
         )
+    )
+    parser.add_argument(
+        "--no-pet",
+        action="store_true",
+        help="Desactiva la mascota Poodle y el split scrolling en la terminal"
     )
     parser.add_argument(
         "--check-links",
@@ -193,19 +213,31 @@ def main() -> int:
                 "Usá --cookie - o MOODLE_SESSION_COOKIE."
             )
 
+    # Iniciar la interfaz con la mascota Poodle en la terminal
+    user_disp = config.user or "Sesión Moodle"
+    PoodleUI.start(
+        disabled=args.no_pet,
+        status="Listo para raspar",
+        user_info=user_disp,
+        base_url=config.base_url,
+    )
+
     try:
-        Logger.header("MOODLE 4.x SCRAPER & TEORÍA EXTRACTOR - ITU UNCUYO")
         prompt_for_base_url(config)
         prompt_for_credentials(config)
         cli = MoodleCLI(config)
         return cli.run(args)
     except KeyboardInterrupt:
         print("\n")
+        Logger.set_pet_status("Operación interrumpida")
         Logger.warn("Proceso interrumpido por el usuario (Ctrl+C).")
         return 130
     except Exception as e:
+        Logger.set_pet_status("Error crítico")
         Logger.error(f"Error crítico en la ejecución: {e}")
         return 1
+    finally:
+        PoodleUI.stop()
 
 
 if __name__ == "__main__":

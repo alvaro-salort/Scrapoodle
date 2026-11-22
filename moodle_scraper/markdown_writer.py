@@ -9,29 +9,36 @@ import re
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional
 from urllib.parse import quote
-from bs4 import BeautifulSoup, NavigableString, Tag
+from selectolax.lexbor import LexborHTMLParser, LexborNode
 
 from moodle_scraper.parser import Course, CourseSection, CourseModule, FileItem
 from moodle_scraper.utils import Logger, make_absolute_url
 
 
-def _create_soup(html: str) -> BeautifulSoup:
-    """Crea una instancia de BeautifulSoup utilizando lxml (más veloz) con fallback a html.parser."""
-    try:
-        return BeautifulSoup(html, "lxml")
-    except Exception:
-        return BeautifulSoup(html, "html.parser")
+def _iter_children(node: LexborNode):
+    """Itera sobre todos los hijos directos de un nodo (incluyendo nodos de texto)."""
+    curr = node.child
+    while curr:
+        yield curr
+        curr = curr.next
 
 
-def extract_image_source(image: Tag) -> str:
+def extract_image_source(image) -> str:
     """
     Obtiene la URL real de una imagen, contemplando lazy-loading.
     Prioriza src, luego data-src y finalmente el primer candidato de srcset.
     Los data URI se usan sólo si no hay una URL alternativa.
     """
+    if hasattr(image, "attributes"):
+        attrs = image.attributes or {}
+    elif hasattr(image, "get"):
+        attrs = {k: image.get(k) for k in ("src", "data-src", "srcset")}
+    else:
+        attrs = {}
+
     inline_data_uri = ""
     for attr in ("src", "data-src"):
-        value = (image.get(attr) or "").strip()
+        value = (attrs.get(attr) or "").strip()
         if not value:
             continue
         if value.startswith(("data:", "cid:")):
@@ -39,14 +46,14 @@ def extract_image_source(image: Tag) -> str:
             continue
         return value
 
-    srcset = (image.get("srcset") or "").strip()
+    srcset = (attrs.get("srcset") or "").strip()
     if srcset:
         return srcset.split(",")[0].strip().split(" ")[0]
     return inline_data_uri
 
 
 class MarkdownFormatter:
-    """Convierte fragmentos de HTML de Moodle a texto Markdown limpio y formateado."""
+    """Convierte fragmentos de HTML de Moodle a texto Markdown limpio y formateado con selectolax."""
 
     @classmethod
     def html_to_markdown(
@@ -59,33 +66,34 @@ class MarkdownFormatter:
         if not html_str or not html_str.strip():
             return ""
 
-        soup = _create_soup(html_str)
+        tree = LexborHTMLParser(html_str)
         
         # Eliminar elementos no deseados
-        for tag in soup(["script", "style", "meta", "noscript", "svg"]):
+        for tag in tree.css("script, style, meta, noscript, svg"):
             tag.decompose()
 
-        return cls._render_node(soup, image_paths or {}, image_base_url).strip()
+        root = tree.body if tree.body is not None else tree.root
+        if not root:
+            return ""
+
+        return cls._render_node(root, image_paths or {}, image_base_url).strip()
 
     @classmethod
     def _render_node(
         cls,
-        node,
+        node: LexborNode,
         image_paths: Mapping[str, str],
         image_base_url: Optional[str] = None,
     ) -> str:
         """Renderiza recursivamente nodos del DOM a sintaxis Markdown."""
-        if isinstance(node, NavigableString):
-            text = str(node)
+        if node.tag == "-text":
+            text = node.text(strip=False)
             # Reemplazar múltiples espacios sin perder saltos
             return re.sub(r'[ \t\r\f\v]+', ' ', text)
 
-        if not isinstance(node, Tag):
-            return ""
-
-        tag_name = node.name.lower()
+        tag_name = node.tag.lower()
         children_text = "".join(
-            cls._render_node(child, image_paths, image_base_url) for child in node.children
+            cls._render_node(child, image_paths, image_base_url) for child in _iter_children(node)
         )
 
         if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
@@ -119,7 +127,7 @@ class MarkdownFormatter:
             return f"`{t}`" if t else ""
 
         elif tag_name == "pre":
-            t = node.get_text()
+            t = node.text()
             return f"\n\n```\n{t.strip()}\n```\n\n"
 
         elif tag_name == "blockquote":
@@ -129,25 +137,30 @@ class MarkdownFormatter:
 
         elif tag_name == "ul":
             items = []
-            for li in node.find_all("li", recursive=False):
-                li_text = cls._render_node(li, image_paths, image_base_url).strip()
-                if li_text:
-                    items.append(f"- {li_text}")
+            for child in _iter_children(node):
+                if child.tag.lower() == "li":
+                    li_text = cls._render_node(child, image_paths, image_base_url).strip()
+                    if li_text:
+                        items.append(f"- {li_text}")
             return "\n" + "\n".join(items) + "\n" if items else ""
 
         elif tag_name == "ol":
             items = []
-            for i, li in enumerate(node.find_all("li", recursive=False), 1):
-                li_text = cls._render_node(li, image_paths, image_base_url).strip()
-                if li_text:
-                    items.append(f"{i}. {li_text}")
+            idx = 1
+            for child in _iter_children(node):
+                if child.tag.lower() == "li":
+                    li_text = cls._render_node(child, image_paths, image_base_url).strip()
+                    if li_text:
+                        items.append(f"{idx}. {li_text}")
+                        idx += 1
             return "\n" + "\n".join(items) + "\n" if items else ""
 
         elif tag_name == "li":
             return children_text.strip()
 
         elif tag_name == "a":
-            href = node.get("href", "")
+            attrs = node.attributes or {}
+            href = attrs.get("href", "")
             text = children_text.strip() or href
             if href and not href.startswith("javascript:"):
                 return f"[{text}]({href})"
@@ -155,7 +168,8 @@ class MarkdownFormatter:
 
         elif tag_name == "img":
             src = extract_image_source(node)
-            alt = node.get("alt", "imagen")
+            attrs = node.attributes or {}
+            alt = attrs.get("alt", "imagen")
             if src:
                 lookup = make_absolute_url(image_base_url, src) if image_base_url else src
                 local_path = image_paths.get(lookup, src)
@@ -171,13 +185,13 @@ class MarkdownFormatter:
         elif tag_name == "table":
             return cls._render_table(node)
 
-        # Contenedores neutros (div, span, section, article, etc.)
+        # Contenedores neutros (div, span, section, article, body, etc.)
         return children_text
 
     @classmethod
-    def _render_table(cls, table_tag: Tag) -> str:
-        """Renderiza tablas HTML simples a Markdown."""
-        rows = table_tag.find_all("tr")
+    def _render_table(cls, table_tag: LexborNode) -> str:
+        """Renderiza tablas HTML simples a Markdown con selectolax."""
+        rows = table_tag.css("tr")
         if not rows:
             return ""
 
@@ -185,11 +199,11 @@ class MarkdownFormatter:
         col_count = 0
 
         for r_idx, tr in enumerate(rows):
-            cells = tr.find_all(["th", "td"])
+            cells = tr.css("th, td")
             if not cells:
                 continue
             col_count = max(col_count, len(cells))
-            row_vals = [c.get_text(" ", strip=True).replace("|", "\\|") for c in cells]
+            row_vals = [c.text(strip=True).replace("|", "\\|") for c in cells]
             md_rows.append("| " + " | ".join(row_vals) + " |")
 
             # Encabezado separador después de la primera fila

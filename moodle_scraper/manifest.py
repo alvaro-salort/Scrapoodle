@@ -1,5 +1,6 @@
 """
-Manifest de descargas: registra URL, ruta local, tamaño y SHA-256.
+Manifest de descargas con serialización ultrarrápida (msgspec):
+Registra URL, ruta local, tamaño y SHA-256.
 
 Permite reanudar sin re-descargar archivos que no cambiaron y verificar
 que los archivos locales siguen coincidiendo con lo descargado.
@@ -7,12 +8,11 @@ que los archivos locales siguen coincidiendo con lo descargado.
 
 import datetime
 import hashlib
-import json
 import os
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Union
-
+import msgspec
 
 MANIFEST_NAME = "manifest.json"
 
@@ -26,8 +26,20 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+class CourseInfo(msgspec.Struct, kw_only=True):
+    id: str = ""
+    name: str = ""
+
+
+class ManifestPayload(msgspec.Struct, kw_only=True):
+    version: int = 1
+    course: CourseInfo = msgspec.field(default_factory=CourseInfo)
+    generated_at: str = ""
+    entries: Dict[str, dict] = msgspec.field(default_factory=dict)
+
+
 class RunManifest:
-    """Manifest JSON de una corrida, persistido dentro de la carpeta del curso."""
+    """Manifest JSON de una corrida con motor msgspec, persistido dentro de la carpeta del curso."""
 
     def __init__(self, root: Path, course_id: str = "", course_name: str = ""):
         self.root = Path(root).resolve()
@@ -43,15 +55,18 @@ class RunManifest:
         if not self.path.exists():
             return
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = self.path.read_bytes()
+            data = msgspec.json.decode(raw)
+            if isinstance(data, dict):
+                course_data = data.get("course", {})
+                if isinstance(course_data, dict):
+                    self.course_id = course_data.get("id", self.course_id)
+                    self.course_name = course_data.get("name", self.course_name)
+                entries = data.get("entries", {})
+                if isinstance(entries, dict):
+                    self.entries = entries
+        except (OSError, msgspec.DecodeError):
             return
-
-        self.course_id = data.get("course", {}).get("id", self.course_id)
-        self.course_name = data.get("course", {}).get("name", self.course_name)
-        entries = data.get("entries", {})
-        if isinstance(entries, dict):
-            self.entries = entries
 
     @staticmethod
     def load(root: Path) -> "RunManifest":
@@ -151,11 +166,12 @@ class RunManifest:
                 "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 "entries": dict(self.entries),
             }
-            payload = json.dumps(data, ensure_ascii=False, indent=2)
+            # Serialización acelerada con msgspec.json
+            payload = msgspec.json.format(msgspec.json.encode(data), indent=2)
 
         self.root.mkdir(parents=True, exist_ok=True)
         temp_path = self.path.with_suffix(".json.tmp")
-        temp_path.write_text(payload + "\n", encoding="utf-8")
+        temp_path.write_bytes(payload + b"\n")
         os.replace(temp_path, self.path)
 
         with self._lock:

@@ -1,53 +1,50 @@
 """
-Módulo de Configuración para el Moodle Scraper.
-Soporta carga desde archivos .env, scraper.conf (INI) y variables de entorno del sistema.
+Módulo de Configuración Declarativa para Scrapoodle.
+Utiliza Pydantic Settings v2 para validación tipada y carga jerárquica de variables.
 """
 
-import os
-import sys
 import configparser
 import getpass
-from dataclasses import dataclass, field
+import os
 from pathlib import Path
-from typing import Optional
-
-# Carga opcional de python-dotenv si está disponible
-try:
-    from dotenv import load_dotenv
-    DOTENV_AVAILABLE = True
-except ImportError:
-    DOTENV_AVAILABLE = False
+from typing import Optional, List
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _parse_bool(val: Optional[str], default: bool = False) -> bool:
-    if val is None:
-        return default
-    return str(val).strip().lower() in ("true", "1", "yes", "si", "s", "t")
+class ScraperConfig(BaseSettings):
+    """Clase de configuración central del scraper construida con Pydantic Settings v2."""
+    model_config = SettingsConfigDict(
+        extra="ignore",
+        populate_by_name=True,
+    )
 
+    user: str = Field(default="", validation_alias="MOODLE_USER")
+    password: str = Field(default="", validation_alias="MOODLE_PASSWORD")
+    base_url: str = Field(default="https://aulas.itu.uncu.edu.ar/itu/", validation_alias="MOODLE_BASE_URL")
+    download_dir: Path = Field(default_factory=lambda: Path("./downloads"), validation_alias="DOWNLOAD_DIR")
+    timeout: int = Field(default=30, validation_alias="REQUEST_TIMEOUT")
+    max_retries: int = Field(default=3, validation_alias="MAX_RETRIES")
+    chunk_size_kb: int = Field(default=8, validation_alias="CHUNK_SIZE_KB")
+    overwrite_existing: bool = Field(default=False, validation_alias="OVERWRITE_EXISTING")
+    save_section_summaries: bool = Field(default=True, validation_alias="SAVE_SECTION_SUMMARIES")
+    save_consolidated_markdown: bool = Field(default=True, validation_alias="SAVE_CONSOLIDATED_MARKDOWN")
+    max_workers: int = Field(default=3, validation_alias="MAX_WORKERS")
+    request_delay: float = Field(default=0.0, validation_alias="REQUEST_DELAY")
+    session_cookie: Optional[str] = Field(default=None, validation_alias="MOODLE_SESSION_COOKIE")
 
-@dataclass
-class ScraperConfig:
-    """Clase de configuración central del scraper."""
-    user: str = ""
-    password: str = ""
-    base_url: str = "https://aulas.itu.uncu.edu.ar/itu/"
-    download_dir: Path = field(default_factory=lambda: Path("./downloads"))
-    timeout: int = 30
-    max_retries: int = 3
-    chunk_size_kb: int = 8
-    overwrite_existing: bool = False
-    save_section_summaries: bool = True
-    save_consolidated_markdown: bool = True
-    max_workers: int = 3
-    request_delay: float = 0.0
-    session_cookie: Optional[str] = None
+    @field_validator("base_url")
+    @classmethod
+    def normalize_base_url(cls, v: str) -> str:
+        if v and not v.endswith("/"):
+            return v + "/"
+        return v
 
-    def validate(self) -> list[str]:
+    def validate(self) -> List[str]:
         """Valida que los parámetros indispensables estén configurados."""
-        errors = []
+        errors: List[str] = []
         if not self.base_url or not self.base_url.startswith(("http://", "https://")):
             errors.append("La URL base de Moodle no es válida o está vacía.")
-        # Si no hay cookie de sesión provista, se requieren usuario y contraseña
         if not self.session_cookie:
             if not self.user:
                 errors.append("El usuario (MOODLE_USER) no está configurado.")
@@ -75,7 +72,6 @@ def prompt_for_credentials(
             "Usuario de Moodle (Enter para usar cookie de sesión): "
         ).strip()
 
-    # SSO / Google / Microsoft: permitir pegar la cookie sin usar argumentos visibles
     if not config.user:
         config.session_cookie = password_func("Cookie MoodleSession: ").strip()
         return
@@ -84,101 +80,64 @@ def prompt_for_credentials(
         config.password = password_func("Contraseña de Moodle: ")
 
 
+def prompt_retry_credentials(
+    config: ScraperConfig,
+    input_func=input,
+    password_func=getpass.getpass,
+) -> bool:
+    """
+    Pregunta al usuario si desea reintentar ingresando nuevamente la contraseña
+    (o cambiar de usuario) cuando las credenciales fueron rechazadas por Moodle.
+    """
+    try:
+        choice = input_func(
+            "¿Desea reintentar ingresando la contraseña nuevamente? [S/n] ('u' para cambiar usuario): "
+        ).strip().lower()
+    except (EOFError, OSError):
+        return False
+
+    if choice in ("n", "no", "q", "salir", "exit"):
+        return False
+
+    if choice in ("u", "user", "usuario"):
+        config.user = ""
+        config.password = ""
+        config.session_cookie = None
+        try:
+            prompt_for_credentials(config, input_func=input_func, password_func=password_func)
+        except (EOFError, OSError):
+            return False
+        return bool((config.user and config.password) or config.session_cookie)
+
+    if config.user:
+        config.password = ""
+        config.session_cookie = None
+        try:
+            config.password = password_func("Contraseña de Moodle: ")
+        except (EOFError, OSError):
+            return False
+        return bool(config.password)
+
+    config.session_cookie = None
+    config.password = ""
+    try:
+        prompt_for_credentials(config, input_func=input_func, password_func=password_func)
+    except (EOFError, OSError):
+        return False
+    return bool((config.user and config.password) or config.session_cookie)
+
+
 def prompt_for_base_url(config: ScraperConfig, input_func=input) -> None:
     """Solicita la URL base de Moodle cuando no fue configurada."""
     if config.base_url:
         return
 
-    config.base_url = input_func("URL base de Moodle: ").strip()
-    if config.base_url and not config.base_url.endswith("/"):
-        config.base_url += "/"
-
-
-def load_config(
-    env_path: Optional[str | Path] = None,
-    conf_path: Optional[str | Path] = None
-) -> ScraperConfig:
-    """
-    Carga la configuración con la siguiente prioridad:
-    1. Variables de entorno activas en el sistema
-    2. Archivo .env
-    3. Archivo scraper.conf / config.ini
-    4. Valores por defecto
-    """
-    # 1. Intentar cargar .env si existe
-    if env_path is None:
-        default_env = Path(".env")
-        if default_env.exists() and DOTENV_AVAILABLE:
-            load_dotenv(dotenv_path=default_env)
-        elif default_env.exists() and not DOTENV_AVAILABLE:
-            # Parseo manual liviano si no está instalado python-dotenv
-            _parse_env_file_manually(default_env)
-    elif Path(env_path).exists():
-        if DOTENV_AVAILABLE:
-            load_dotenv(dotenv_path=env_path, override=True)
-        else:
-            _parse_env_file_manually(Path(env_path))
-
-    # 2. Intentar cargar scraper.conf si existe
-    conf_values = {}
-    if conf_path is None:
-        for candidate in [Path("scraper.conf"), Path("config.ini"), Path("moodle.conf")]:
-            if candidate.exists():
-                conf_values = _read_ini_file(candidate)
-                break
-    elif Path(conf_path).exists():
-        conf_values = _read_ini_file(Path(conf_path))
-
-    # 3. Ensamblar valores con precedencia (ENV > CONF > DEFAULT)
-    user = os.getenv("MOODLE_USER") or conf_values.get("user") or ""
-    password = os.getenv("MOODLE_PASSWORD") or conf_values.get("password") or ""
-    session_cookie = os.getenv("MOODLE_SESSION_COOKIE") or conf_values.get("session_cookie") or None
-    
-    base_url = os.getenv("MOODLE_BASE_URL") or conf_values.get("base_url") or ""
-    if base_url and not base_url.endswith("/"):
-        base_url += "/"
-
-    download_dir_str = (
-        os.getenv("DOWNLOAD_DIR")
-        or conf_values.get("download_dir")
-        or "./downloads"
-    )
-    download_dir = Path(download_dir_str).resolve()
-
-    timeout = int(os.getenv("REQUEST_TIMEOUT") or conf_values.get("timeout") or 30)
-    max_retries = int(os.getenv("MAX_RETRIES") or conf_values.get("max_retries") or 3)
-    chunk_size_kb = int(os.getenv("CHUNK_SIZE_KB") or conf_values.get("chunk_size_kb") or 8)
-    max_workers = int(os.getenv("MAX_WORKERS") or conf_values.get("max_workers") or 3)
-    request_delay = float(os.getenv("REQUEST_DELAY") or conf_values.get("request_delay") or 0.0)
-
-    overwrite_existing = _parse_bool(
-        os.getenv("OVERWRITE_EXISTING"),
-        default=_parse_bool(conf_values.get("overwrite_existing"), default=False)
-    )
-    save_section_summaries = _parse_bool(
-        os.getenv("SAVE_SECTION_SUMMARIES"),
-        default=_parse_bool(conf_values.get("save_section_summaries"), default=True)
-    )
-    save_consolidated_markdown = _parse_bool(
-        os.getenv("SAVE_CONSOLIDATED_MARKDOWN"),
-        default=_parse_bool(conf_values.get("save_consolidated_markdown"), default=True)
-    )
-
-    return ScraperConfig(
-        user=user,
-        password=password,
-        base_url=base_url,
-        download_dir=download_dir,
-        timeout=timeout,
-        max_retries=max_retries,
-        chunk_size_kb=chunk_size_kb,
-        overwrite_existing=overwrite_existing,
-        save_section_summaries=save_section_summaries,
-        save_consolidated_markdown=save_consolidated_markdown,
-        max_workers=max_workers,
-        request_delay=request_delay,
-        session_cookie=session_cookie
-    )
+    val = input_func("URL base de Moodle: ").strip()
+    if not val:
+        val = "https://aulas.itu.uncu.edu.ar/itu/"
+    if val and not val.endswith("/"):
+        val += "/"
+    config.base_url = val
 
 
 def _read_ini_file(path: Path) -> dict:
@@ -195,19 +154,61 @@ def _read_ini_file(path: Path) -> dict:
         return {}
 
 
-def _parse_env_file_manually(path: Path) -> None:
-    """Parser manual de emergencia para archivos .env."""
+def load_config(
+    env_path: Optional[str | Path] = None,
+    conf_path: Optional[str | Path] = None
+) -> ScraperConfig:
+    """
+    Carga la configuración combinando .env (via pydantic-settings), archivos INI y variables del sistema.
+    """
+    env_file = Path(env_path) if env_path else (Path(".env") if Path(".env").exists() else None)
+
+    # Valores desde archivo INI si existe
+    conf_values = {}
+    if conf_path is not None and Path(conf_path).exists():
+        conf_values = _read_ini_file(Path(conf_path))
+    elif conf_path is None:
+        for candidate in [Path("scraper.conf"), Path("config.ini"), Path("moodle.conf")]:
+            if candidate.exists():
+                conf_values = _read_ini_file(candidate)
+                break
+
+    init_kwargs = {}
+    if env_file and env_file.exists():
+        init_kwargs["_env_file"] = str(env_file)
+    else:
+        init_kwargs["_env_file"] = None
+
+    # Mapear conf_values si existen
+    for key, val in conf_values.items():
+        if key in ScraperConfig.model_fields and val is not None:
+            init_kwargs[key] = val
+
+    if "base_url" not in conf_values and "MOODLE_BASE_URL" not in os.environ:
+        if not env_file or not env_file.exists():
+            init_kwargs["base_url"] = ""
+        else:
+            try:
+                content = env_file.read_text(encoding="utf-8")
+                if "MOODLE_BASE_URL" not in content:
+                    init_kwargs["base_url"] = ""
+            except Exception:
+                init_kwargs["base_url"] = ""
+
+    # Instanciar Pydantic Settings
+    # Las variables de entorno de os.environ y _env_file tienen precedencia
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    k = k.strip()
-                    v = v.strip().strip("'\"")
-                    if k and k not in os.environ:
-                        os.environ[k] = v
+        config = ScraperConfig(**init_kwargs)
     except Exception:
-        pass
+        # Fallback si ocurre algún tipo de validación estricta
+        config = ScraperConfig()
+
+    # Ignorar placeholders de .env.example para solicitar credenciales reales al inicio
+    if config.user in ("tu_usuario_aqui", "tu_usuario"):
+        config.user = ""
+    if config.password in ("tu_contraseña_aqui", "tu_contrasena_aqui", "tu_password_aqui"):
+        config.password = ""
+    if config.session_cookie in ("tu_cookie_moodlesession_aqui", ""):
+        config.session_cookie = None
+
+    return config

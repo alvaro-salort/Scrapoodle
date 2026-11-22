@@ -150,3 +150,95 @@ def test_concurrent_download_execution(tmp_path):
         assert stats.files_downloaded == 5
         assert stats.files_failed == 0
         assert len(mod.files) == 1
+
+
+def test_login_never_caches_logintoken_and_allows_retry(tmp_path):
+    import httpx
+    import hishel
+    from moodle_scraper.session import _MoodleSqliteStorage
+
+    cfg = ScraperConfig(
+        base_url="https://aulas.itu.uncu.edu.ar/itu/",
+        user="alvaro",
+        password="wrong_password",
+    )
+    session = MoodleSession(cfg)
+
+    get_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_calls
+        if request.method == "GET" and str(request.url) == "https://aulas.itu.uncu.edu.ar/itu/login/index.php":
+            get_calls += 1
+            return httpx.Response(
+                200,
+                headers={
+                    "Set-Cookie": f"MoodleSession=sess_{get_calls}; path=/itu/; secure; SameSite=None",
+                    "Content-Type": "text/html; charset=utf-8",
+                },
+                content=f'<input type="hidden" name="logintoken" value="token_{get_calls}">'.encode(),
+            )
+        if request.method == "POST" and str(request.url) == "https://aulas.itu.uncu.edu.ar/itu/login/index.php":
+            body = request.content.decode()
+            cookie_hdr = request.headers.get("cookie", "")
+            expected_token = f"logintoken=token_{get_calls}"
+            expected_cookie = f"MoodleSession=sess_{get_calls}"
+            if expected_token in body and expected_cookie in cookie_hdr and "password=correct_password" in body:
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    content=b'<html><div class="userbutton">Alvaro ITU</div><script>var M = {cfg: {sesskey: "sk_ok"}};</script></html>',
+                )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+                content=b'<html><div id="loginerrormessage">Acceso inv\xc3\xa1lido. Por favor, int\xc3\xa9ntelo otra vez.</div></html>',
+            )
+        return httpx.Response(404)
+
+    storage = _MoodleSqliteStorage(database_path=str(tmp_path / "cache.sqlite"))
+    transport = hishel.httpx.CacheTransport(
+        next_transport=httpx.MockTransport(handler),
+        storage=storage,
+        rfc=True,
+    )
+    session.client = hishel.httpx.CacheClient(
+        transport=transport,
+        follow_redirects=True,
+    )
+    session.session = session.client
+
+    # Primer intento con contraseña incorrecta debe lanzar MoodleAuthError (credenciales inválidas)
+    with pytest.raises(MoodleAuthError) as exc_info:
+        session.login()
+    assert session.is_invalid_credentials_error(exc_info.value) is True
+    assert get_calls == 1
+
+    # Segundo intento tras actualizar la contraseña NO debe servir login/index.php desde caché
+    cfg.password = "correct_password"
+    assert session.login() is True
+    assert get_calls == 2
+    assert session.is_authenticated is True
+    assert session.sesskey == "sk_ok"
+    assert session.user_fullname == "Alvaro ITU"
+    storage.close()
+
+
+def test_extract_user_fullname_ignores_usermenu_dropdown():
+    cfg = ScraperConfig(base_url="https://aulas.itu.uncu.edu.ar/itu/")
+    session = MoodleSession(cfg)
+    dashboard_html = """
+    <html>
+        <div class="usermenu">
+            <div class="dropdown-menu">
+                <a href="#">Perfil</a><a href="#">Calificaciones</a><a href="#">Cerrar sesión</a>
+            </div>
+        </div>
+        <div class="logininfo">
+            Usted se ha identificado como <a href="https://aulas.itu.uncu.edu.ar/itu/user/profile.php?id=999">JUAN PEREZ</a>
+        </div>
+    </html>
+    """
+    assert session._extract_user_fullname(dashboard_html) == "JUAN PEREZ"
+
+

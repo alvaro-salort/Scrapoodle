@@ -1,57 +1,98 @@
 """
 Gestor de Sesión y Autenticación para Moodle 4.x (ITU UNCUYO).
-Maneja cookies persistentes, extracción de logintoken CSRF y obtención de sesskey.
+Implementado con httpx + hishel para gestión automática de caché RFC 9111 (ETag, 304 Not Modified).
 """
 
+import functools
 import re
+import ssl
 import time
-import requests
+import uuid
+from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
+
+import httpx
+import hishel
+from hishel.httpx import CacheClient, AsyncCacheClient
+from selectolax.lexbor import LexborHTMLParser
 
 from moodle_scraper.config import ScraperConfig
 from moodle_scraper.utils import Logger
 
 
-def _create_soup(html: str) -> BeautifulSoup:
-    """Crea un objeto BeautifulSoup prefiriendo lxml (más veloz) con fallback a html.parser."""
-    try:
-        return BeautifulSoup(html, "lxml")
-    except Exception:
-        return BeautifulSoup(html, "html.parser")
+@functools.lru_cache(maxsize=1)
+def _get_ssl_context() -> ssl.SSLContext:
+    """Crea y reutiliza el contexto SSL por defecto para evitar recargar el almacén de certificados en cada instancia."""
+    return ssl.create_default_context()
 
 
 class MoodleAuthError(Exception):
     """Excepción lanzada cuando la autenticación en Moodle falla."""
-    pass
+
+    def __init__(self, message: str, *, invalid_credentials: bool = False):
+        super().__init__(message)
+        self.invalid_credentials = invalid_credentials
+
+
+class _MoodleSqliteStorage(hishel.SqliteStorage):
+    """Almacenamiento SQLite RFC 9111 que excluye estrictamente endpoints de login/autenticación."""
+
+    def get_entries(self, key: str):
+        if MoodleSession.is_login_url(key):
+            return []
+        entries = super().get_entries(key)
+        return [
+            e for e in entries
+            if not MoodleSession.is_login_url(getattr(e.request, "url", ""))
+        ]
+
+    def create_entry(self, request, response, key: str, *, ttl=None, tti=None):
+        if MoodleSession.is_login_url(getattr(request, "url", "")):
+            return hishel.Entry(id=uuid.uuid4(), request=request, response=response)
+        return super().create_entry(request, response, key, ttl=ttl, tti=tti)
+
+
+class _AsyncThreadSqliteStorage(hishel.AsyncBaseStorage):
+    """Adaptador asíncrono para SqliteStorage cuando anysqlite no está instalado."""
+
+    def __init__(self, sync_storage: hishel.SqliteStorage):
+        super().__init__()
+        self._sync = sync_storage
+
+    async def create_entry(self, request, response, key, *, ttl=None, tti=None):
+        import asyncio
+        return await asyncio.to_thread(
+            self._sync.create_entry, request, response, key, ttl=ttl, tti=tti
+        )
+
+    async def get_entries(self, key):
+        import asyncio
+        return await asyncio.to_thread(self._sync.get_entries, key)
+
+    async def remove_entry(self, id):
+        import asyncio
+        return await asyncio.to_thread(self._sync.remove_entry, id)
+
+    async def update_headers(self, id, new_headers):
+        import asyncio
+        return await asyncio.to_thread(self._sync.update_headers, id, new_headers)
+
+    async def close(self):
+        import asyncio
+        await asyncio.to_thread(self._sync.close)
 
 
 class MoodleSession:
-    """Administra la sesión HTTP, autenticación y llamadas a la API/Web de Moodle."""
+    """Administra la sesión HTTP, autenticación y llamadas a la API de Moodle con httpx y hishel."""
 
     def __init__(self, config: ScraperConfig):
         self.config = config
-        self.session = requests.Session()
         self.sesskey: Optional[str] = None
         self.is_authenticated: bool = False
         self.user_fullname: Optional[str] = None
 
-        # Configurar reintentos automáticos para errores de red transitorios (429, 500, 502, 503, 504)
-        retries = Retry(
-            total=config.max_retries,
-            backoff_factor=1.0,
-            status_forcelist=[429, 500, 502, 503, 504],
-            raise_on_status=False
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
-        # Configurar cabeceras de navegador moderno
-        self.session.headers.update({
+        self._headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -60,60 +101,135 @@ class MoodleSession:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
             "Connection": "keep-alive"
-        })
+        }
 
-        # Si se proporcionó una cookie de sesión directa, configurarla acotada al host de Moodle
+        # Configurar cookies iniciales si hay session_cookie
+        cookies = httpx.Cookies()
         if self.config.session_cookie:
             parsed_base = urlparse(self.config.base_url)
-            cookie_kwargs = {
-                "path": "/",
-                "secure": parsed_base.scheme == "https",
-            }
-            if parsed_base.hostname:
-                cookie_kwargs["domain"] = parsed_base.hostname
-            self.session.cookies.set("MoodleSession", self.config.session_cookie, **cookie_kwargs)
+            hostname = parsed_base.hostname or ""
+            cookies.set("MoodleSession", self.config.session_cookie, domain=hostname, path="/")
+
+        # Configuración de almacenamiento SQLite para RFC 9111
+        cache_dir = Path(".cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Eliminar caché antigua sin RFC si existiera para evitar tokens CSRF o sesiones cacheadas
+        legacy_cache = cache_dir / "moodle_cache.sqlite"
+        if legacy_cache.exists():
+            try:
+                legacy_cache.unlink()
+            except OSError:
+                pass
+
+        cache_db_path = str(cache_dir / "moodle_cache_rfc.sqlite")
+        self._sync_storage = _MoodleSqliteStorage(database_path=cache_db_path)
+        self._cache_db_path = cache_db_path
+        self._timeout = httpx.Timeout(float(config.timeout), connect=10.0)
+        self._async_client: Optional[AsyncCacheClient] = None
+
+        # Cliente sincronizado con Hishel en modo estricto RFC 9111 (rfc=True)
+        self.client = CacheClient(
+            storage=self._sync_storage,
+            rfc=True,
+            headers=self._headers,
+            cookies=cookies,
+            timeout=self._timeout,
+            follow_redirects=True,
+            verify=_get_ssl_context(),
+        )
+
+        # Alias session para compatibilidad con código existente
+        self.session = self.client
+
+        def _prepare_request(req):
+            method = getattr(req, "method", "GET")
+            url = getattr(req, "url", str(req))
+            return self.client.build_request(method, url)
+
+        self.client.prepare_request = _prepare_request
+
+    @property
+    def async_client(self) -> AsyncCacheClient:
+        """Inicializa perezosamente el cliente asíncrono cuando se requiere."""
+        if self._async_client is None:
+            try:
+                async_storage = hishel.AsyncSqliteStorage(database_path=self._cache_db_path)
+            except (ImportError, Exception):
+                async_storage = _AsyncThreadSqliteStorage(self._sync_storage)
+            self._async_client = AsyncCacheClient(
+                storage=async_storage,
+                rfc=True,
+                headers=self._headers,
+                cookies=self.client.cookies,
+                timeout=self._timeout,
+                follow_redirects=True,
+                verify=_get_ssl_context(),
+            )
+        return self._async_client
+
+    def close(self) -> None:
+        """Cierra los clientes HTTP."""
+        try:
+            self.client.close()
+        except Exception:
+            pass
 
     @staticmethod
     def is_login_url(url: str) -> bool:
         """Indica si una URL corresponde a la página de login de Moodle."""
-        path = urlparse(url or "").path.lower().rstrip("/")
+        path = urlparse(str(url) if url else "").path.lower().rstrip("/")
         return path == "/login/index.php" or path.endswith("/login/index.php")
 
-    def is_login_response(self, response: requests.Response) -> bool:
+    @staticmethod
+    def is_invalid_credentials_error(error: BaseException) -> bool:
+        """Indica si un error de autenticación se debe a credenciales inválidas o rechazadas."""
+        if getattr(error, "invalid_credentials", False):
+            return True
+        msg = str(error).lower()
+        if any(net in msg for net in ("no se pudo conectar", "error de red")):
+            return False
+        return any(
+            kw in msg
+            for kw in (
+                "acceso inválido",
+                "acceso invalido",
+                "invalid login",
+                "credenciales fueron rechazadas",
+                "error de autenticación reportado por moodle",
+                "error de autenticacion reportado por moodle",
+                "cookie de sesión",
+                "cookie de sesion",
+                "credenciales incompletas",
+            )
+        )
+
+    def is_login_response(self, response: httpx.Response) -> bool:
         """Indica si la respuesta terminó en la página de login (sesión expirada)."""
-        return self.is_login_url(getattr(response, "url", ""))
+        return self.is_login_url(str(getattr(response, "url", "")))
 
     def _resolve_url(self, endpoint: str) -> str:
         """Construye una URL absoluta a partir de un endpoint relativo."""
         return urljoin(self.config.base_url, endpoint)
 
     def extract_logintoken(self) -> Tuple[str, str]:
-        """
-        Realiza una petición GET a login/index.php para extraer el token CSRF (logintoken)
-        y el anchor requerido por Moodle 4.x.
-        """
+        """Obtiene el token CSRF (logintoken) y anchor desde login/index.php."""
         login_url = self._resolve_url("login/index.php")
         Logger.info(f"Obteniendo página de login y token CSRF: {login_url}")
-        
+
         try:
-            resp = self.session.get(login_url, timeout=self.config.timeout)
+            resp = self.client.get(login_url)
             resp.raise_for_status()
-        except requests.RequestException as e:
+        except Exception as e:
             raise MoodleAuthError(f"No se pudo conectar a la página de login de Moodle: {e}")
 
-        soup = _create_soup(resp.text)
-        
-        # Buscar input oculto 'logintoken'
-        token_input = soup.find("input", {"name": "logintoken"})
-        logintoken = token_input.get("value", "") if token_input else ""
-        
-        # Buscar input 'anchor' si existe
-        anchor_input = soup.find("input", {"name": "anchor"})
-        anchor = anchor_input.get("value", "") if anchor_input else ""
+        tree = LexborHTMLParser(resp.text)
+        token_input = tree.css_first("input[name='logintoken']")
+        logintoken = (token_input.attributes.get("value") or "") if token_input else ""
 
-        # Moodle 4.x puede incluir logintoken directamente en el formulario
+        anchor_input = tree.css_first("input[name='anchor']")
+        anchor = (anchor_input.attributes.get("value") or "") if anchor_input else ""
+
         if not logintoken:
-            # Buscar en regex como respaldo
             match = re.search(r'name=["\']logintoken["\']\s+value=["\']([^"\']+)["\']', resp.text)
             if match:
                 logintoken = match.group(1)
@@ -124,25 +240,30 @@ class MoodleSession:
         return logintoken, anchor
 
     def login(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
-        """
-        Realiza la autenticación en Moodle 4.x.
-        Soporta tanto inicio de sesión tradicional con credenciales como validación de cookie MoodleSession.
-        """
-        # A) Autenticación por cookie de sesión preexistente (SSO / Captcha bypass)
-        if self.config.session_cookie:
+        """Realiza la autenticación en Moodle 4.x con soporte de credenciales o cookie."""
+        self.is_authenticated = False
+        self.sesskey = None
+        self.user_fullname = None
+
+        if self.config.session_cookie and not username and not password:
+            parsed_base = urlparse(self.config.base_url)
+            hostname = parsed_base.hostname or ""
+            self.client.cookies.set("MoodleSession", self.config.session_cookie, domain=hostname, path="/")
             Logger.info("Validando autenticación con cookie MoodleSession...")
             try:
-                resp = self.get("my/", allow_redirects=True)
-                resp.raise_for_status()
-            except requests.RequestException as e:
+                resp = self.get("my/")
+            except Exception as e:
                 raise MoodleAuthError(f"Error de red validando cookie de sesión: {e}")
 
-            if "login/index.php" in resp.url:
-                raise MoodleAuthError("La cookie de sesión (MOODLE_SESSION_COOKIE) es inválida o ha expirado.")
+            if "login/index.php" in str(resp.url):
+                raise MoodleAuthError(
+                    "La cookie de sesión (MOODLE_SESSION_COOKIE) es inválida o ha expirado.",
+                    invalid_credentials=True,
+                )
 
-            soup = _create_soup(resp.text)
+            tree = LexborHTMLParser(resp.text)
             self.sesskey = self._extract_sesskey(resp.text)
-            self.user_fullname = self._extract_user_fullname(soup)
+            self.user_fullname = self._extract_user_fullname(tree)
             self.is_authenticated = True
 
             user_disp = self.user_fullname or "Sesión SSO"
@@ -151,15 +272,19 @@ class MoodleSession:
                 Logger.info("Clave de sesión (sesskey) obtenida")
             return True
 
-        # B) Autenticación tradicional mediante usuario y contraseña
         user = username or self.config.user
         pwd = password or self.config.password
 
         if not user or not pwd:
-            raise MoodleAuthError("Credenciales incompletas. Verifique MOODLE_USER y MOODLE_PASSWORD (o configure MOODLE_SESSION_COOKIE).")
+            raise MoodleAuthError(
+                "Credenciales incompletas. Configure MOODLE_USER y MOODLE_PASSWORD.",
+                invalid_credentials=True,
+            )
+
+        # Limpiar cookies previas antes de negociar un nuevo logintoken CSRF y MoodleSession
+        self.client.cookies.clear()
 
         logintoken, anchor = self.extract_logintoken()
-
         login_post_url = self._resolve_url("login/index.php")
         payload = {
             "anchor": anchor,
@@ -171,37 +296,33 @@ class MoodleSession:
 
         Logger.info(f"Autenticando usuario '{user}' en Moodle...")
         try:
-            resp = self.session.post(
-                login_post_url,
-                data=payload,
-                timeout=self.config.timeout,
-                allow_redirects=True
-            )
+            resp = self.client.post(login_post_url, data=payload)
             resp.raise_for_status()
-        except requests.RequestException as e:
+        except Exception as e:
             raise MoodleAuthError(f"Error de red durante el intento de login: {e}")
 
-        # Comprobar si hubo error en la página devuelta
-        soup = _create_soup(resp.text)
-        
-        # Detección de mensajes de error típicos de Moodle
-        error_elem = (
-            soup.find("div", {"id": "loginerrormessage"})
-            or soup.find("div", class_=re.compile(r"alert-danger|notifyproblem"))
-            or soup.find("span", class_="error")
-        )
-        
+        tree = LexborHTMLParser(resp.text)
+        error_elem = None
+        for sel in ("#loginerrormessage", ".alert-danger", ".notifyproblem", "span.error"):
+            cand = tree.css_first(sel)
+            if cand and cand.text(strip=True):
+                error_elem = cand
+                break
         if error_elem:
-            error_text = error_elem.get_text(strip=True)
-            raise MoodleAuthError(f"Error de autenticación reportado por Moodle: {error_text}")
+            error_text = error_elem.text(strip=True)
+            raise MoodleAuthError(
+                f"Error de autenticación reportado por Moodle: {error_text}",
+                invalid_credentials=True,
+            )
 
-        # Comprobar si seguimos en la página de login con formulario activo
-        if "login/index.php" in resp.url and soup.find("input", {"name": "password"}):
-            raise MoodleAuthError("Fallo de autenticación: Las credenciales fueron rechazadas por Moodle.")
+        if "login/index.php" in str(resp.url) and tree.css_first("input[name='password']"):
+            raise MoodleAuthError(
+                "Fallo de autenticación: Las credenciales fueron rechazadas por Moodle.",
+                invalid_credentials=True,
+            )
 
-        # Extraer sesskey y datos del usuario de la respuesta
         self.sesskey = self._extract_sesskey(resp.text)
-        self.user_fullname = self._extract_user_fullname(soup)
+        self.user_fullname = self._extract_user_fullname(tree)
         self.is_authenticated = True
 
         Logger.success(f"Autenticación exitosa! Sesión iniciada como: {self.user_fullname or user}")
@@ -211,59 +332,88 @@ class MoodleSession:
         return True
 
     def _extract_sesskey(self, html_content: str) -> Optional[str]:
-        """Extrae el sesskey de configuraciones de Javascript o enlaces en el HTML."""
-        # 1. Buscar en objeto M.cfg de JavaScript o asignaciones JS
+        """Extrae el sesskey desde configuraciones de Javascript o HTML."""
         match = re.search(r'["\']?sesskey["\']?\s*[:=]\s*["\']([a-zA-Z0-9_-]+)["\']', html_content)
         if match:
             return match.group(1)
-        
-        # 2. Buscar en enlaces de logout o parámetros url ?sesskey=...
         match = re.search(r'[?&]sesskey=([a-zA-Z0-9_-]+)', html_content)
         if match:
             return match.group(1)
-
-        # 3. Buscar en inputs hidden
         match = re.search(r'<input[^>]+name=["\']sesskey["\'][^>]+value=["\']([a-zA-Z0-9_-]+)["\']', html_content)
         if match:
             return match.group(1)
-
         return None
 
-    def _extract_user_fullname(self, soup: BeautifulSoup) -> Optional[str]:
-        """Intenta extraer el nombre completo del usuario conectado desde el navbar."""
-        user_menu = (
-            soup.find("div", class_="userbutton")
-            or soup.find("span", class_="usertext")
-            or soup.find("div", class_="usermenu")
-        )
+    def _extract_user_fullname(self, tree: LexborHTMLParser | str) -> Optional[str]:
+        """Extrae el nombre completo del usuario conectado desde el navbar o pie de sesión."""
+        if isinstance(tree, str):
+            tree = LexborHTMLParser(tree)
+        for sel in (".usertext", ".userbutton", ".logininfo a[href*='user/profile.php']"):
+            elem = tree.css_first(sel)
+            if elem:
+                text = elem.text(strip=True)
+                if text:
+                    return text
+
+        user_menu = tree.css_first(".usermenu")
         if user_menu:
-            return user_menu.get_text(strip=True)
+            menu_tree = LexborHTMLParser(user_menu.html or "")
+            for drop in menu_tree.css(".dropdown-menu, #user-action-menu, .sr-only, .accesshide"):
+                drop.decompose()
+            text = menu_tree.text(strip=True)
+            if text:
+                return text
         return None
 
-    def get(self, url_or_endpoint: str, **kwargs) -> requests.Response:
-        """Petición GET envuelta con URL resolution, control de retardo y timeout por defecto."""
+    @staticmethod
+    def _normalize_httpx_kwargs(kwargs: dict) -> dict:
+        """Adapta argumentos heredados de requests (stream, allow_redirects) a httpx."""
+        kwargs.pop("stream", None)
+        if "allow_redirects" in kwargs:
+            kwargs["follow_redirects"] = kwargs.pop("allow_redirects")
+        return kwargs
+
+    def get(self, url_or_endpoint: str, **kwargs) -> httpx.Response:
+        """Petición GET sincronizada con caché RFC 9111 y detección de sesión expirada."""
         if self.config.request_delay > 0:
             time.sleep(self.config.request_delay)
         target_url = self._resolve_url(url_or_endpoint)
-        kwargs.setdefault("timeout", self.config.timeout)
-        response = self.session.get(target_url, **kwargs)
+        self._normalize_httpx_kwargs(kwargs)
+        response = self.client.get(target_url, **kwargs)
         if self.is_authenticated and self.is_login_response(response):
             response.close()
-            raise MoodleAuthError(
-                "La sesión de Moodle expiró o fue invalidada. Volvé a iniciar sesión."
-            )
+            raise MoodleAuthError("La sesión de Moodle expiró o fue invalidada. Volvé a iniciar sesión.")
         return response
 
-    def post(self, url_or_endpoint: str, **kwargs) -> requests.Response:
-        """Petición POST envuelta con URL resolution, control de retardo y timeout por defecto."""
+    def post(self, url_or_endpoint: str, **kwargs) -> httpx.Response:
+        """Petición POST sincronizada con detección de sesión expirada."""
         if self.config.request_delay > 0:
             time.sleep(self.config.request_delay)
         target_url = self._resolve_url(url_or_endpoint)
-        kwargs.setdefault("timeout", self.config.timeout)
-        response = self.session.post(target_url, **kwargs)
+        self._normalize_httpx_kwargs(kwargs)
+        response = self.client.post(target_url, **kwargs)
         if self.is_authenticated and self.is_login_response(response):
             response.close()
-            raise MoodleAuthError(
-                "La sesión de Moodle expiró o fue invalidada. Volvé a iniciar sesión."
-            )
+            raise MoodleAuthError("La sesión de Moodle expiró o fue invalidada. Volvé a iniciar sesión.")
         return response
+
+    async def aget(self, url_or_endpoint: str, **kwargs) -> httpx.Response:
+        """Petición GET asíncrona para TaskGroup."""
+        target_url = self._resolve_url(url_or_endpoint)
+        self._normalize_httpx_kwargs(kwargs)
+        response = await self.async_client.get(target_url, **kwargs)
+        if self.is_authenticated and self.is_login_response(response):
+            await response.aclose()
+            raise MoodleAuthError("La sesión de Moodle expiró o fue invalidada. Volvé a iniciar sesión.")
+        return response
+
+    async def apost(self, url_or_endpoint: str, **kwargs) -> httpx.Response:
+        """Petición POST asíncrona para TaskGroup."""
+        target_url = self._resolve_url(url_or_endpoint)
+        self._normalize_httpx_kwargs(kwargs)
+        response = await self.async_client.post(target_url, **kwargs)
+        if self.is_authenticated and self.is_login_response(response):
+            await response.aclose()
+            raise MoodleAuthError("La sesión de Moodle expiró o fue invalidada. Volvé a iniciar sesión.")
+        return response
+

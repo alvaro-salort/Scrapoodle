@@ -61,3 +61,41 @@ def test_cli_returns_two_when_session_expires_during_download():
     )
 
     assert cli.run(None) == 2
+
+
+def test_cli_retries_login_on_invalid_credentials_and_succeeds():
+    cli = _make_cli()
+    from moodle_scraper.session import MoodleAuthError
+
+    cli.session.login = MagicMock(
+        side_effect=[
+            MoodleAuthError(
+                "Error de autenticación reportado por Moodle: Acceso inválido. Por favor, inténtelo otra vez.",
+                invalid_credentials=True,
+            ),
+            True,
+        ]
+    )
+    cli._prompt_credential_retry = MagicMock(return_value=True)
+    cli.course_scraper.process_course = MagicMock(
+        return_value=CourseProcessingStats(files_downloaded=1, links_broken=0)
+    )
+
+    assert cli.run(None) == 0
+    assert cli.session.login.call_count == 2
+    cli._prompt_credential_retry.assert_called_once()
+
+
+def test_cli_does_not_retry_login_on_network_error():
+    cli = _make_cli()
+    from moodle_scraper.session import MoodleAuthError
+
+    cli.session.login = MagicMock(
+        side_effect=MoodleAuthError("No se pudo conectar a la página de login de Moodle: timeout")
+    )
+    cli._prompt_credential_retry = MagicMock(return_value=True)
+
+    assert cli.run(None) == 1
+    assert cli.session.login.call_count == 1
+    cli._prompt_credential_retry.assert_not_called()
+

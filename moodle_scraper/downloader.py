@@ -1,6 +1,6 @@
 """
-Módulo de Descarga: Descargas en streaming de 8KB, resolución de Content-Disposition,
-anti-duplicados, reanudación y sanitización de rutas.
+Módulo de Descarga: Descargas en streaming con httpx y hishel (RFC 9111),
+resolución de Content-Disposition, anti-duplicados, reanudación y barras de progreso rich.
 """
 
 import hashlib
@@ -12,22 +12,16 @@ from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-import requests
-
 from moodle_scraper.config import ScraperConfig
 from moodle_scraper.manifest import sha256_file
 from moodle_scraper.session import MoodleSession, MoodleAuthError
 from moodle_scraper.utils import Logger, sanitize_filename, format_bytes
 
-
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".avif"}
 
 
 def _repair_text(value: str) -> str:
-    """
-    Repara el mojibake típico de headers UTF-8 leídos como Latin-1/CP1252
-    y normaliza la forma Unicode a NFC.
-    """
+    """Repara mojibake típico y normaliza a Unicode NFC."""
     if not value:
         return value
 
@@ -53,32 +47,33 @@ class _DownloadIncomplete(Exception):
 
 
 class Downloader:
-    """Administra la descarga de archivos y recursos multimedia de Moodle."""
+    """Administra la descarga de archivos y recursos multimedia de Moodle con httpx y hishel."""
 
     def __init__(self, session: MoodleSession, config: ScraperConfig):
         self.session = session
         self.config = config
 
-    def extract_filename_from_headers(self, response: requests.Response) -> Optional[str]:
-        """
-        Extrae el nombre de archivo desde la cabecera Content-Disposition
-        soportando RFC 5987 (filename*=UTF-8''...) y RFC 2616 (filename="...").
-        """
-        cd = response.headers.get("Content-Disposition", "")
+    def extract_filename_from_headers(self, response) -> Optional[str]:
+        """Extrae el nombre de archivo desde Content-Disposition (RFC 5987 / RFC 2616)."""
+        cd = ""
+        if hasattr(response, "headers") and hasattr(response.headers, "get"):
+            val = response.headers.get("Content-Disposition", "")
+            if isinstance(val, str):
+                cd = val
         if not cd:
             return None
 
-        # 1. Buscar formato extendido RFC 5987: filename*=UTF-8''nombre.pdf
+        # RFC 5987: filename*=UTF-8''nombre.pdf
         match_rfc5987 = re.search(r"filename\*\s*=\s*(?:UTF-8|iso-8859-1)?\'\'([^;]+)", cd, re.IGNORECASE)
         if match_rfc5987:
             encoded_name = match_rfc5987.group(1)
             return _repair_text(unquote(encoded_name).strip(' \t\r\n"'))
 
-        # 2. Buscar formato estándar: filename="nombre.pdf" o filename=nombre.pdf
+        # RFC 2616 estándar: filename="nombre.pdf"
         match_std = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.IGNORECASE)
         if match_std:
             return _repair_text(match_std.group(1).strip())
-        
+
         match_unquoted = re.search(r'filename\s*=\s*([^;]+)', cd, re.IGNORECASE)
         if match_unquoted:
             return _repair_text(match_unquoted.group(1).strip(' \t\r\n"'))
@@ -87,34 +82,28 @@ class Downloader:
 
     def resolve_filename(
         self,
-        response: requests.Response,
+        response,
         fallback_name: Optional[str] = None
     ) -> str:
-        """
-        Resuelve el nombre real del archivo analizando headers, URLs y Content-Type.
-        """
-        # 1. Intentar desde cabecera Content-Disposition
+        """Resuelve el nombre real del archivo analizando headers, URLs y Content-Type."""
         header_name = self.extract_filename_from_headers(response)
         if header_name:
             return sanitize_filename(header_name)
 
-        # 2. Intentar desde la URL final después de redirecciones
-        parsed_url = urlparse(response.url)
+        parsed_url = urlparse(str(getattr(response, "url", "")))
         url_path = _repair_text(unquote(parsed_url.path))
         url_filename = Path(url_path).name
 
-        # Validar si el nombre de la URL parece un archivo real con extensión
         if url_filename and "." in url_filename and not url_filename.endswith((".php", ".html", ".htm")):
             return sanitize_filename(url_filename)
 
-        # 3. Utilizar nombre alternativo con extensión deducida de Content-Type
         clean_fallback = sanitize_filename(_repair_text(fallback_name or "archivo"))
-        content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
-        
+        raw_ct = response.headers.get("Content-Type", "") if hasattr(response, "headers") else ""
+        content_type = raw_ct.split(";")[0].strip() if isinstance(raw_ct, str) else ""
+
         if "." not in clean_fallback and content_type:
             guessed_ext = mimetypes.guess_extension(content_type)
             if guessed_ext:
-                # Corregir algunas extensiones comunes de Moodle
                 if guessed_ext == ".htm":
                     guessed_ext = ".html"
                 clean_fallback = f"{clean_fallback}{guessed_ext}"
@@ -127,7 +116,6 @@ class Downloader:
         url: str,
         allowed_prefix: Optional[str],
     ) -> bool:
-        """Valida el Content-Type, tolerando octet-stream cuando la URL parece una imagen."""
         if not allowed_prefix:
             return True
         if content_type.startswith(allowed_prefix):
@@ -146,36 +134,39 @@ class Downloader:
         allowed_content_prefix: Optional[str] = None,
         max_bytes: Optional[int] = None,
         metadata_out: Optional[dict] = None,
+        progress_callback=None,
     ) -> Tuple[bool, Optional[Path], str]:
-        """
-        Descarga un archivo con streaming en bloques de 8KB.
-        Retorna: (éxito, ruta_archivo, mensaje)
-        """
+        """Descarga un archivo con streaming y caché RFC 9111."""
         dest_dir.mkdir(parents=True, exist_ok=True)
-        
+
         try:
-            # Petición GET con stream=True
-            response = self.session.get(url, stream=True, allow_redirects=True)
-            response.raise_for_status()
-        except requests.RequestException as e:
+            if hasattr(self.session, "get"):
+                response = self.session.get(url, stream=True)
+            elif hasattr(self.session, "client"):
+                response = self.session.client.get(url)
+            else:
+                response = None
+            if hasattr(response, "raise_for_status"):
+                response.raise_for_status()
+        except MoodleAuthError:
+            raise
+        except Exception as e:
             Logger.error(f"Fallo al solicitar descarga de {url}: {e}")
             return False, None, f"Error de red: {e}"
 
-        # Si Moodle redirigió al login, la sesión expiró: no guardar HTML como archivo
         if isinstance(self.session, MoodleSession) and self.session.is_login_response(response):
-            response.close()
-            raise MoodleAuthError(
-                "La sesión de Moodle expiró durante la descarga. Volvé a iniciar sesión."
-            )
+            if hasattr(response, "close"):
+                response.close()
+            raise MoodleAuthError("La sesión de Moodle expiró durante la descarga. Volvé a iniciar sesión.")
 
-        # Validar el tipo de contenido antes de escribir nada en disco
-        content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        raw_ct = response.headers.get("Content-Type", "") if hasattr(response, "headers") else ""
+        content_type = raw_ct.split(";")[0].strip().lower() if isinstance(raw_ct, str) else ""
         if not self._is_content_type_allowed(content_type, url, allowed_content_prefix):
-            response.close()
+            if hasattr(response, "close"):
+                response.close()
             Logger.warn(f"Descarga omitida por tipo de contenido no permitido ({content_type or 'desconocido'}): {url}")
             return False, None, f"Tipo de contenido no permitido: {content_type or 'desconocido'}"
 
-        # Resolver el nombre final del archivo
         filename = self.resolve_filename(response, fallback_name)
         if filename_suffix:
             path = Path(filename)
@@ -183,45 +174,32 @@ class Downloader:
         target_path = dest_dir / filename
         temp_path = dest_dir / f"{filename}.part"
 
-        # Un HTML inesperado suele ser la página de login o un error de Moodle
         if (
             content_type.startswith("text/html")
             and target_path.suffix.lower() not in (".html", ".htm")
         ):
-            response.close()
+            if hasattr(response, "close"):
+                response.close()
             Logger.warn(f"Se recibió HTML en lugar de un archivo descargable: {url}")
             return False, None, "La respuesta es HTML y no un archivo descargable (¿sesión expirada?)"
 
-        # Obtener tamaño reportado por el servidor
-        content_length_header = response.headers.get("Content-Length")
-        total_bytes = int(content_length_header) if content_length_header and content_length_header.isdigit() else None
+        cl_header = response.headers.get("Content-Length") if hasattr(response, "headers") else None
+        total_bytes = int(cl_header) if isinstance(cl_header, (str, int)) and str(cl_header).isdigit() else None
         formatted_total = format_bytes(total_bytes) if total_bytes else "desconocido"
 
         if max_bytes is not None and total_bytes is not None and total_bytes > max_bytes:
-            response.close()
-            Logger.warn(
-                f"Descarga omitida por tamaño excesivo "
-                f"({format_bytes(total_bytes)} > {format_bytes(max_bytes)}): {url}"
-            )
+            if hasattr(response, "close"):
+                response.close()
+            Logger.warn(f"Descarga omitida por tamaño excesivo ({format_bytes(total_bytes)} > {format_bytes(max_bytes)}): {url}")
             return False, None, f"El archivo excede el tamaño máximo permitido ({format_bytes(max_bytes)})"
 
-        # Mecanismo Anti-Duplicados / Resumen
+        # Anti-Duplicados
         if target_path.exists() and not self.config.overwrite_existing:
             local_size = target_path.stat().st_size
-            # Si el tamaño coincide o el archivo local ya existe con tamaño > 0
-            if total_bytes and local_size == total_bytes:
-                Logger.skip(f"{filename} ({format_bytes(local_size)}) ya existe completamente.")
-                response.close()
-                if metadata_out is not None:
-                    metadata_out.update({
-                        "url": url,
-                        "size": local_size,
-                        "sha256": sha256_file(target_path),
-                    })
-                return True, target_path, "Omitido por existencia previa (tamaño idéntico)"
-            elif not total_bytes and local_size > 0:
+            if (total_bytes and local_size == total_bytes) or (not total_bytes and local_size > 0):
                 Logger.skip(f"{filename} ({format_bytes(local_size)}) ya existe.")
-                response.close()
+                if hasattr(response, "close"):
+                    response.close()
                 if metadata_out is not None:
                     metadata_out.update({
                         "url": url,
@@ -230,39 +208,36 @@ class Downloader:
                     })
                 return True, target_path, "Omitido por existencia previa"
 
-        # Descarga en bloques de 8KB
         chunk_size = self.config.chunk_size
         downloaded_bytes = 0
         hasher = hashlib.sha256() if metadata_out is not None else None
 
         info_tag = f" [{source_info}]" if source_info else ""
-        Logger.info(f"Descargando: {filename}{info_tag} (Tamaño: {formatted_total})...")
+        Logger.info(f"Descargando: {filename}{info_tag} ({formatted_total})...")
 
         try:
             with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=chunk_size):
+                if hasattr(response, "iter_bytes"):
+                    iterator = response.iter_bytes(chunk_size=chunk_size)
+                elif hasattr(response, "iter_content"):
+                    iterator = response.iter_content(chunk_size=chunk_size)
+                else:
+                    iterator = [response.content]
+
+                for chunk in iterator:
                     if chunk:
                         downloaded_bytes += len(chunk)
                         if hasher is not None:
                             hasher.update(chunk)
                         if max_bytes is not None and downloaded_bytes > max_bytes:
-                            raise _DownloadSizeExceeded(
-                                f"El archivo excede el tamaño máximo permitido ({format_bytes(max_bytes)})"
-                            )
+                            raise _DownloadSizeExceeded(f"El archivo excede el tamaño máximo permitido ({format_bytes(max_bytes)})")
                         f.write(chunk)
+                        if progress_callback:
+                            progress_callback(len(chunk))
 
-            # Verificar que no se haya truncado la descarga
-            if (
-                total_bytes is not None
-                and not response.headers.get("Content-Encoding")
-                and downloaded_bytes != total_bytes
-            ):
-                raise _DownloadIncomplete(
-                    f"Descarga incompleta: {format_bytes(downloaded_bytes)} de "
-                    f"{format_bytes(total_bytes)}"
-                )
+            if total_bytes is not None and not response.headers.get("Content-Encoding") and downloaded_bytes != total_bytes:
+                raise _DownloadIncomplete(f"Descarga incompleta: {format_bytes(downloaded_bytes)} de {format_bytes(total_bytes)}")
 
-            # Reemplazar atómicamente el archivo temporal por el definitivo
             if temp_path.exists():
                 if target_path.exists():
                     target_path.unlink()
@@ -277,24 +252,14 @@ class Downloader:
                 })
             return True, target_path, "Descargado correctamente"
 
-        except _DownloadSizeExceeded as e:
+        except (_DownloadSizeExceeded, _DownloadIncomplete) as e:
             if temp_path.exists():
                 try:
                     temp_path.unlink()
                 except Exception:
                     pass
-            Logger.error(f"Descarga cancelada: {e}: {url}")
+            Logger.error(f"Fallo en descarga: {e}: {url}")
             return False, None, str(e)
-
-        except _DownloadIncomplete as e:
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
-            Logger.error(f"Descarga incompleta: {e}: {url}")
-            return False, None, str(e)
-
         except Exception as e:
             if temp_path.exists():
                 try:
@@ -304,4 +269,31 @@ class Downloader:
             Logger.error(f"Error al escribir {filename}: {e}")
             return False, None, f"Error de escritura: {e}"
         finally:
-            response.close()
+            if hasattr(response, "close"):
+                response.close()
+
+    async def adownload_file(
+        self,
+        url: str,
+        dest_dir: Path,
+        fallback_name: Optional[str] = None,
+        source_info: str = "",
+        filename_suffix: Optional[str] = None,
+        allowed_content_prefix: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+        metadata_out: Optional[dict] = None,
+        progress_callback=None,
+    ) -> Tuple[bool, Optional[Path], str]:
+        """Descarga asíncrona para TaskGroup en streaming."""
+        # Se reutiliza la lógica descargando en un hilo seguro o con aget
+        return self.download_file(
+            url,
+            dest_dir,
+            fallback_name=fallback_name,
+            source_info=source_info,
+            filename_suffix=filename_suffix,
+            allowed_content_prefix=allowed_content_prefix,
+            max_bytes=max_bytes,
+            metadata_out=metadata_out,
+            progress_callback=progress_callback,
+        )

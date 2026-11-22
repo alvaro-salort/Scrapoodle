@@ -5,6 +5,7 @@ from moodle_scraper.config import (
     load_config,
     prompt_for_base_url,
     prompt_for_credentials,
+    prompt_retry_credentials,
 )
 
 
@@ -83,3 +84,35 @@ def test_prompt_is_skipped_for_session_cookie():
 
     input_func.assert_not_called()
     password_func.assert_not_called()
+
+
+def test_prompt_retry_credentials_reprompts_only_password_by_default():
+    input_func = Mock(return_value="s")
+    password_func = Mock(return_value="nueva_clave")
+    config = ScraperConfig(user="alvaro", password="clave_vieja")
+
+    retried = prompt_retry_credentials(config, input_func, password_func)
+
+    assert retried is True
+    assert config.user == "alvaro"
+    assert config.password == "nueva_clave"
+    password_func.assert_called_once_with("Contraseña de Moodle: ")
+
+
+def test_prompt_retry_credentials_allows_changing_user():
+    input_func = Mock(side_effect=["u", "nuevo_usuario"])
+    password_func = Mock(return_value="nueva_clave")
+    config = ScraperConfig(user="alvaro", password="clave_vieja")
+
+    retried = prompt_retry_credentials(config, input_func, password_func)
+
+    assert retried is True
+    assert config.user == "nuevo_usuario"
+    assert config.password == "nueva_clave"
+
+
+def test_prompt_retry_credentials_cancel_on_no_or_eof():
+    config = ScraperConfig(user="alvaro", password="clave_vieja")
+    assert prompt_retry_credentials(config, Mock(return_value="n"), Mock()) is False
+    assert prompt_retry_credentials(config, Mock(side_effect=EOFError), Mock()) is False
+

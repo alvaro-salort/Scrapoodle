@@ -1,24 +1,23 @@
 """
-Interfaz de Línea de Comandos (CLI) interactiva y automatizada para el Moodle Scraper.
-Permite descubrir cursos, seleccionar interactivamente o procesar en lote.
+Interfaz de Línea de Comandos (CLI) interactiva y automatizada para Scrapoodle.
+Permite descubrir cursos, seleccionar interactivamente o procesar en lote con la mascota Poodle.
 """
 
 import argparse
 import sys
 import time
 from typing import List, Optional
-import requests
-
-from moodle_scraper.config import ScraperConfig
+from moodle_scraper.config import ScraperConfig, prompt_retry_credentials
 from moodle_scraper.course_scraper import CourseScraper, CourseProcessingStats
 from moodle_scraper.course_selector import CourseSelection, CourseSelector
 from moodle_scraper.parser import Course, MoodleParser
 from moodle_scraper.session import MoodleSession, MoodleAuthError
-from moodle_scraper.utils import Logger, Colors
+from moodle_scraper.utils import Logger, Colors, _safe_print, console, _log_lock
+from rich.table import Table
 
 
 class MoodleCLI:
-    """Controlador de interacción y flujo CLI."""
+    """Controlador de interacción y flujo CLI de Scrapoodle."""
 
     def __init__(self, config: ScraperConfig):
         self.config = config
@@ -27,9 +26,14 @@ class MoodleCLI:
         self.course_selector = CourseSelector(config.base_url)
         self.discovered_courses: List[Course] = []
 
+    def _prompt_credential_retry(self) -> bool:
+        """Ofrece reintentar el ingreso de contraseña/credenciales si fueron rechazadas."""
+        return prompt_retry_credentials(self.config)
+
     def run(self, args: Optional[argparse.Namespace] = None) -> int:
         """Punto de entrada principal del flujo CLI."""
         # Validar configuración
+        Logger.set_pet_status("Verificando configuración...")
         errors = self.config.validate()
         if errors:
             for err in errors:
@@ -37,29 +41,40 @@ class MoodleCLI:
             Logger.warn("Por favor configure sus credenciales en el archivo .env o scraper.conf")
             return 1
 
-        # 1. Autenticación
-        try:
-            self.session.login()
-        except MoodleAuthError as e:
-            Logger.error(str(e))
-            return 1
-        except Exception as e:
-            Logger.error(f"Error inesperado al iniciar sesión: {e}")
-            return 1
+        # 1. Autenticación (con opción de reintentar contraseña si las credenciales son inválidas)
+        while True:
+            try:
+                Logger.set_pet_status("Iniciando sesión en Moodle...")
+                self.session.login()
+                break
+            except MoodleAuthError as e:
+                Logger.set_pet_status("Error de autenticación")
+                Logger.error(str(e))
+                if self.session.is_invalid_credentials_error(e) and self._prompt_credential_retry():
+                    continue
+                return 1
+            except Exception as e:
+                Logger.set_pet_status("Error al conectar")
+                Logger.error(f"Error inesperado al iniciar sesión: {e}")
+                return 1
 
         # 2. Descubrimiento de Cursos
         try:
+            Logger.set_pet_status("Buscando cursos matriculados...")
             self.discovered_courses = self.discover_enrolled_courses()
         except MoodleAuthError as e:
             Logger.error(str(e))
             return 2
         if not self.discovered_courses:
+            Logger.set_pet_status("Sin cursos matriculados")
             Logger.warn("No se encontraron cursos matriculados en la cuenta o la plataforma no los listó.")
             return 0
 
         # 3. Selección de cursos a procesar
+        Logger.set_pet_status("Esperando selección de cursos...")
         selected_courses = self._select_courses(args)
         if not selected_courses:
+            Logger.set_pet_status("Operación cancelada")
             Logger.info("Operación cancelada por el usuario.")
             return 0
 
@@ -71,6 +86,7 @@ class MoodleCLI:
 
         try:
             for idx, course in enumerate(selected_courses, 1):
+                Logger.set_pet_status(f"Descargando [{idx}/{len(selected_courses)}]: {course.name[:20]}")
                 stats = self.course_scraper.process_course(
                     course,
                     course_index=idx,
@@ -86,27 +102,29 @@ class MoodleCLI:
                 total_stats.sections_count += stats.sections_count
                 total_stats.links_broken += stats.links_broken
         except MoodleAuthError as e:
+            Logger.set_pet_status("Sesión expirada")
             Logger.error(str(e))
             return 2
 
         elapsed = time.time() - start_time
 
         # 5. Resumen final
+        Logger.set_pet_status("¡Descarga completada con éxito!")
         Logger.header("RESUMEN GENERAL DE DESCARGA")
-        print(f"{Colors.BOLD}{Colors.GREEN}✔ Cursos procesados: {len(selected_courses)}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.CYAN}✔ Archivos nuevos descargados: {total_stats.files_downloaded}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.YELLOW}✔ Archivos omitidos (ya existentes): {total_stats.files_skipped}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.CYAN}✔ Imágenes descargadas: {total_stats.images_downloaded}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.YELLOW}✔ Imágenes omitidas (ya existentes): {total_stats.images_skipped}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.MAGENTA}✔ Páginas teóricas extraídas a Markdown: {total_stats.pages_extracted}{Colors.RESET}")
+        _safe_print(f"{Colors.BOLD}{Colors.GREEN}✔ Cursos procesados: {len(selected_courses)}{Colors.RESET}")
+        _safe_print(f"{Colors.BOLD}{Colors.CYAN}✔ Archivos nuevos descargados: {total_stats.files_downloaded}{Colors.RESET}")
+        _safe_print(f"{Colors.BOLD}{Colors.YELLOW}✔ Archivos omitidos (ya existentes): {total_stats.files_skipped}{Colors.RESET}")
+        _safe_print(f"{Colors.BOLD}{Colors.CYAN}✔ Imágenes descargadas: {total_stats.images_downloaded}{Colors.RESET}")
+        _safe_print(f"{Colors.BOLD}{Colors.YELLOW}✔ Imágenes omitidas (ya existentes): {total_stats.images_skipped}{Colors.RESET}")
+        _safe_print(f"{Colors.BOLD}{Colors.MAGENTA}✔ Páginas teóricas extraídas a Markdown: {total_stats.pages_extracted}{Colors.RESET}")
         if total_stats.files_failed > 0:
-            print(f"{Colors.BOLD}{Colors.RED}✖ Errores en archivos: {total_stats.files_failed}{Colors.RESET}")
+            _safe_print(f"{Colors.BOLD}{Colors.RED}✖ Errores en archivos: {total_stats.files_failed}{Colors.RESET}")
         if total_stats.images_failed > 0:
-            print(f"{Colors.BOLD}{Colors.RED}✖ Errores en imágenes: {total_stats.images_failed}{Colors.RESET}")
+            _safe_print(f"{Colors.BOLD}{Colors.RED}✖ Errores en imágenes: {total_stats.images_failed}{Colors.RESET}")
         if total_stats.links_broken > 0:
-            print(f"{Colors.BOLD}{Colors.RED}✖ Enlaces locales rotos: {total_stats.links_broken}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.WHITE}⏱ Tiempo total: {elapsed:.1f} segundos{Colors.RESET}")
-        print(f"\n{Colors.GREEN}Archivos y teoría organizados en: {self.config.download_dir.resolve()}{Colors.RESET}\n")
+            _safe_print(f"{Colors.BOLD}{Colors.RED}✖ Enlaces locales rotos: {total_stats.links_broken}{Colors.RESET}")
+        _safe_print(f"{Colors.BOLD}{Colors.WHITE}⏱ Tiempo total: {elapsed:.1f} segundos{Colors.RESET}")
+        _safe_print(f"\n{Colors.GREEN}Archivos y teoría organizados en: {self.config.download_dir.resolve()}{Colors.RESET}\n")
 
         if (
             total_stats.files_failed > 0
@@ -195,17 +213,32 @@ class MoodleCLI:
                 f"'{selection.name_filter}'"
             )
 
-        # 4. Modo interactivo
-        print(f"\n{Colors.BOLD}{Colors.CYAN}Cursos disponibles en su cuenta:{Colors.RESET}")
-        print(f"{Colors.DIM}{'─'*70}{Colors.RESET}")
+        # 4. Modo interactivo: Tabla estilizada con scrollback 100% natural
+        table = Table(
+            title="[bold cyan]Cursos Disponibles en su Cuenta (ITU UNCUYO)[/bold cyan]",
+            title_justify="left",
+            border_style="cyan dim",
+            header_style="bold cyan",
+            expand=False,
+            padding=(0, 1),
+        )
+        table.add_column("#", justify="right", style="bold yellow", width=5)
+        table.add_column("Materia / Curso", style="bold white")
+        table.add_column("ID Moodle", justify="right", style="dim cyan", width=12)
+
         for i, c in enumerate(self.discovered_courses, 1):
-            print(f"  {Colors.BOLD}{Colors.YELLOW}[{i:2d}]{Colors.RESET} {c.name} {Colors.DIM}(ID: {c.id}){Colors.RESET}")
-        print(f"{Colors.DIM}{'─'*70}{Colors.RESET}")
-        print(f"  {Colors.BOLD}{Colors.GREEN}[ a]{Colors.RESET} Descargar TODOS los cursos")
-        print(f"  {Colors.BOLD}{Colors.RED}[ q]{Colors.RESET} Salir\n")
+            table.add_row(f"[{i:2d}]", c.name, str(c.id))
+
+        with _log_lock:
+            console.print()
+            console.print(table)
+            console.print(
+                "  [bold green][ a][/bold green] Descargar TODOS los cursos    "
+                "[bold red][ q][/bold red] Salir\n"
+            )
 
         while True:
-            choice = input(f"{Colors.BOLD}{Colors.CYAN}Seleccione una opción (ej: 1, 1-3, 1,4,7 o 'a'): {Colors.RESET}").strip().lower()
+            choice = input("Seleccione una opción (ej: 1, 1-3, 1,4,7 o 'a'): ").strip().lower()
             if not choice:
                 continue
             selected_courses = self.course_selector.select_interactive_choice(
@@ -215,4 +248,5 @@ class MoodleCLI:
             if selected_courses is not None:
                 return selected_courses
 
-            print(f"{Colors.RED}Selección inválida. Intente de nuevo.{Colors.RESET}")
+            with _log_lock:
+                console.print("[bold red]✖ Selección inválida. Intente de nuevo.[/bold red]")

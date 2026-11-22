@@ -5,6 +5,7 @@ Utilidades para el Moodle Scraper: Sanitización de archivos, Logger coloreado y
 import os
 import re
 import sys
+import threading
 import unicodedata
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -25,10 +26,9 @@ except ImportError:
         except Exception:
             pass
 
+from moodle_scraper.poodle import ui_lock, PoodleUI
 
-import threading
-
-_log_lock = threading.Lock()
+_log_lock = ui_lock
 
 # Intentar habilitar UTF-8 en stdout/stderr en Windows si está soportado
 if sys.platform == "win32":
@@ -41,15 +41,23 @@ if sys.platform == "win32":
         pass
 
 
+from rich.console import Console
+
+console = Console(legacy_windows=False, highlight=False, soft_wrap=True)
+
+
 def _safe_print(msg: str = "", end: str = "\n", flush: bool = True) -> None:
-    """Imprime de forma segura en consola protegiendo contra errores de codificación cp1252 y concurrencia."""
+    """Imprime de forma segura en consola con Rich protegiendo contra errores de codificación y concurrencia."""
     with _log_lock:
         try:
-            print(msg, end=end, flush=flush)
-        except UnicodeEncodeError:
-            encoding = sys.stdout.encoding or "utf-8"
-            safe_msg = msg.encode(encoding, errors="replace").decode(encoding)
-            print(safe_msg, end=end, flush=flush)
+            console.out(msg, end=end)
+        except Exception:
+            try:
+                print(msg, end=end, flush=flush)
+            except UnicodeEncodeError:
+                encoding = sys.stdout.encoding or "utf-8"
+                safe_msg = msg.encode(encoding, errors="replace").decode(encoding)
+                print(safe_msg, end=end, flush=flush)
 
 
 class Colors:
@@ -77,58 +85,74 @@ class Colors:
 
 
 class Logger:
-    """Sistema de logging enriquecido con colores e iconografía para consola."""
+    """Sistema de logging enriquecido con rich para consola y mascot UI."""
+
+    @staticmethod
+    def set_pet_status(status: str, mood: Optional[str] = None) -> None:
+        """Actualiza el mensaje de estado y mood de la mascota Poodle."""
+        PoodleUI.set_status(status, mood=mood)
 
     @staticmethod
     def header(title: str) -> None:
-        line = "=" * 70
-        _safe_print(f"\n{Colors.BOLD}{Colors.CYAN}{line}{Colors.RESET}")
-        _safe_print(f"{Colors.BOLD}{Colors.CYAN}  {title.center(66)}  {Colors.RESET}")
-        _safe_print(f"{Colors.BOLD}{Colors.CYAN}{line}{Colors.RESET}\n")
+        PoodleUI.set_status(title)
+        with _log_lock:
+            console.print()
+            console.rule(f"[bold cyan]{title}[/bold cyan]", style="dim cyan")
+            console.print()
 
     @staticmethod
     def course_header(course_name: str, index: int = 0, total: int = 0) -> None:
         counter = f" [{index}/{total}]" if total > 0 else ""
-        _safe_print(f"\n{Colors.BOLD}{Colors.MAGENTA}┌{'─'*68}┐{Colors.RESET}")
-        _safe_print(f"{Colors.BOLD}{Colors.MAGENTA}│ 🎓 CURSO{counter}: {Colors.WHITE}{course_name[:56]:<56}{Colors.MAGENTA}│{Colors.RESET}")
-        _safe_print(f"{Colors.BOLD}{Colors.MAGENTA}└{'─'*68}┘{Colors.RESET}")
+        PoodleUI.set_status(f"Curso {counter}: {course_name[:25]}", mood="working")
+        with _log_lock:
+            console.print(f"\n[bold magenta]┌{'─'*68}┐[/bold magenta]")
+            console.print(f"[bold magenta]│[/bold magenta] 🎓 [bold white]CURSO{counter}: {course_name[:54]:<54}[/bold white][bold magenta]│[/bold magenta]")
+            console.print(f"[bold magenta]└{'─'*68}┘[/bold magenta]")
 
     @staticmethod
     def section(name: str) -> None:
-        _safe_print(f"\n{Colors.BOLD}{Colors.BLUE}  📁 [SECCIÓN] {name}{Colors.RESET}")
-        _safe_print(f"{Colors.DIM}{Colors.BLUE}  {'─' * 60}{Colors.RESET}")
+        with _log_lock:
+            console.print(f"\n  [bold blue]📁 [SECCIÓN] {name}[/bold blue]")
+            console.print(f"  [dim blue]{'─' * 60}[/dim blue]")
 
     @staticmethod
     def info(msg: str) -> None:
-        _safe_print(f"{Colors.CYAN}  ℹ {msg}{Colors.RESET}")
+        with _log_lock:
+            console.print(f"  [cyan]ℹ[/cyan] {msg}")
 
     @staticmethod
     def success(msg: str) -> None:
-        _safe_print(f"{Colors.BOLD}{Colors.GREEN}  ✔ {msg}{Colors.RESET}")
+        with _log_lock:
+            console.print(f"  [bold green]✔[/bold green] {msg}")
 
     @staticmethod
     def skip(msg: str) -> None:
-        _safe_print(f"{Colors.YELLOW}  ↷ [OMITIDO] {msg}{Colors.RESET}")
+        with _log_lock:
+            console.print(f"  [yellow]↷ [OMITIDO][/yellow] {msg}")
 
     @staticmethod
     def warn(msg: str) -> None:
-        _safe_print(f"{Colors.BOLD}{Colors.YELLOW}  ⚠ [AVISO] {msg}{Colors.RESET}")
+        with _log_lock:
+            console.print(f"  [bold yellow]⚠ [AVISO][/bold yellow] {msg}")
 
     @staticmethod
     def error(msg: str) -> None:
-        _safe_print(f"{Colors.BOLD}{Colors.RED}  ✖ [ERROR] {msg}{Colors.RESET}")
+        with _log_lock:
+            console.print(f"  [bold red]✖ [ERROR][/bold red] {msg}")
 
     @staticmethod
     def text_saved(file_name: str) -> None:
-        _safe_print(f"{Colors.GREEN}  📝 [TEXTO GUARDADO] {file_name}{Colors.RESET}")
+        with _log_lock:
+            console.print(f"  [green]📝 [TEXTO GUARDADO][/green] {file_name}")
 
     @staticmethod
     def download_progress(filename: str, current_kb: float, total_kb: float | None = None) -> None:
-        if total_kb and total_kb > 0:
-            pct = (current_kb / total_kb) * 100
-            _safe_print(f"\r{Colors.CYAN}  ⬇ Descargando {filename}... {current_kb:.1f}KB / {total_kb:.1f}KB ({pct:.1f}%){Colors.RESET}", end="", flush=True)
-        else:
-            _safe_print(f"\r{Colors.CYAN}  ⬇ Descargando {filename}... {current_kb:.1f}KB{Colors.RESET}", end="", flush=True)
+        with _log_lock:
+            if total_kb and total_kb > 0:
+                pct = min(100.0, (current_kb / total_kb) * 100)
+                console.out(f"\r  ⬇ Descargando {filename}... {current_kb:.1f}KB / {total_kb:.1f}KB ({pct:.1f}%)", end="")
+            else:
+                console.out(f"\r  ⬇ Descargando {filename}... {current_kb:.1f}KB", end="")
 
 
 # Nombres reservados en el sistema de archivos de Windows

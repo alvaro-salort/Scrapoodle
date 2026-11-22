@@ -338,3 +338,85 @@ def test_extract_section_links_from_html():
     assert links[0][0] == 0
     assert links[1][0] == 1
     assert links[2][0] == 2
+
+
+def test_parse_course_contents_from_ajax_returns_empty_on_webservice_error():
+    ajax_error = [{
+        "error": True,
+        "exception": {
+            "message": "El servicio Web no está disponible. (No existe o puede estar deshabilitado)",
+            "errorcode": "servicenotavailable",
+            "link": "https://aulas.itu.uncu.edu.ar/itu/",
+        },
+    }]
+    sections = MoodleParser.parse_course_contents_from_ajax(
+        ajax_error,
+        "https://aulas.itu.uncu.edu.ar/itu/",
+    )
+    assert sections == []
+
+
+def test_onetopic_tabs_extracted_when_onetopic_ul_wraps_sections():
+    html = """
+    <body class="format-onetopic path-course">
+        <div class="course-content">
+            <ul class="onetopic">
+                <li id="section-0" class="section main clearfix"></li>
+            </ul>
+            <div class="tabs-wrapper">
+                <ul class="nav nav-tabs format_onetopic-tabs">
+                    <li class="nav-item tab_position_0 tab_level_0"><a class="nav-link" href="/itu/course/view.php?id=2262&section=0">Bienvenida</a></li>
+                    <li class="nav-item tab_position_1 tab_level_0 haschilds"><a class="nav-link" href="/itu/course/view.php?id=2262&section=1">Módulo 1</a></li>
+                </ul>
+                <ul class="nav nav-tabs format_onetopic-tabs">
+                    <li class="nav-item tab_position_1 tab_level_1 subtopic"><a class="nav-link" href="/itu/course/view.php?id=2262&section=1">Inicio</a></li>
+                    <li class="nav-item tab_position_2 tab_level_1 subtopic"><a class="nav-link" href="/itu/course/view.php?id=2262&section=2">Clase 1</a></li>
+                </ul>
+            </div>
+        </div>
+    </body>
+    """
+    base_url = "https://aulas.itu.uncu.edu.ar/itu/"
+    assert MoodleParser.is_onetopic_course(html) is True
+
+    l0 = MoodleParser.extract_onetopic_level_0_tabs(html, base_url, "2262")
+    assert len(l0) == 2
+    assert l0[0]["title"] == "Bienvenida"
+    assert l0[1]["title"] == "Módulo 1"
+    assert l0[1]["haschilds"] is True
+
+    l1 = MoodleParser.extract_onetopic_level_1_tabs(html, base_url, "Módulo 1")
+    assert len(l1) == 2
+    assert l1[0].title == "Inicio"
+    assert l1[1].title == "Clase 1"
+    assert l1[1].section_number == 2
+
+
+def test_parse_label_with_mod_indent_outer():
+    html = """
+    <div class="course-content">
+        <li id="section-0" class="section main">
+            <div class="sectionname">Bienvenida</div>
+            <ul class="section img-text">
+                <li class="activity label modtype_label" id="module-156782">
+                    <div>
+                        <div class="mod-indent-outer w-100">
+                            <div class="activity-description">
+                                <h4>Cronograma de Cursado</h4>
+                                <p>Las clases sincrónicas son los jueves a las 19hs.</p>
+                            </div>
+                        </div>
+                    </div>
+                </li>
+            </ul>
+        </li>
+    </div>
+    """
+    sections = MoodleParser.parse_course_sections(html, "https://aulas.itu.uncu.edu.ar/itu/")
+    assert len(sections) == 1
+    assert len(sections[0].modules) == 1
+    label_mod = sections[0].modules[0]
+    assert label_mod.mod_type == "label"
+    assert label_mod.name == "Cronograma de Cursado"
+    assert "jueves a las 19hs" in label_mod.content_text
+

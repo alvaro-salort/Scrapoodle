@@ -2,14 +2,16 @@
 Orquestador de Procesamiento de Curso: Extrae contenidos, teoría, páginas y descarga recursos.
 """
 
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
-import requests
-from bs4 import BeautifulSoup
+
+import httpx
+from aiolimiter import AsyncLimiter
+from selectolax.lexbor import LexborHTMLParser
 
 from moodle_scraper.config import ScraperConfig
 from moodle_scraper.downloader import Downloader
@@ -19,6 +21,21 @@ from moodle_scraper.manifest import RunManifest
 from moodle_scraper.parser import Course, CourseSection, CourseModule, FileItem, MoodleParser
 from moodle_scraper.session import MoodleSession, MoodleAuthError
 from moodle_scraper.utils import Logger, sanitize_filename, make_absolute_url
+
+
+def _run_async(coro):
+    """Ejecuta una corrutina de forma segura, incluso si ya existe un event loop activo."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    else:
+        return asyncio.run(coro)
 
 
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
@@ -110,7 +127,7 @@ class CourseScraper:
                 resp = self.session.get(course_view_url)
                 resp.raise_for_status()
                 course_html = resp.text
-            except requests.RequestException as e:
+            except (httpx.RequestError, Exception) as e:
                 Logger.error(f"No se pudo cargar el curso {course.name} ({course_view_url}): {e}")
                 return stats
 
@@ -300,8 +317,8 @@ class CourseScraper:
         def collect(html: str) -> None:
             if not html:
                 return
-            soup = BeautifulSoup(html, "lxml")
-            for image in soup.find_all("img"):
+            tree = LexborHTMLParser(html)
+            for image in tree.css("img"):
                 source = extract_image_source(image)
                 if not source or source.startswith(("data:", "cid:")):
                     continue
@@ -314,7 +331,8 @@ class CourseScraper:
                     Logger.info(f"Imagen externa omitida: {absolute_url}")
                     continue
 
-                image_sources.setdefault(absolute_url, image.get("alt", "") or "imagen")
+                alt = (image.attributes or {}).get("alt", "") or "imagen"
+                image_sources.setdefault(absolute_url, alt)
 
         for section in sections:
             collect(section.summary_html)
@@ -344,28 +362,38 @@ class CourseScraper:
 
         tasks = list(image_sources.items())
         workers = max(1, self.config.max_workers)
-        results = []
+        limiter = AsyncLimiter(1, self.config.request_delay) if self.config.request_delay > 0 else None
+        sem = asyncio.Semaphore(workers)
 
-        if workers > 1 and len(tasks) > 1:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(download, task) for task in tasks]
-                for future in as_completed(futures):
-                    try:
-                        results.append(future.result())
-                    except MoodleAuthError:
-                        raise
-                    except Exception as e:
-                        stats.images_failed += 1
-                        Logger.error(f"Error inesperado al descargar imagen: {e}")
-        else:
-            for task in tasks:
+        async def _download_task(task):
+            image_url, alt = task
+            async with sem:
+                if limiter:
+                    async with limiter:
+                        pass
+                return await asyncio.to_thread(download, task)
+
+        async def _run_all_images():
+            results = []
+            auth_error = None
+            async with asyncio.TaskGroup() as tg:
+                handles = [tg.create_task(_download_task(t)) for t in tasks]
+            for h in handles:
                 try:
-                    results.append(download(task))
-                except MoodleAuthError:
-                    raise
+                    results.append(h.result())
+                except MoodleAuthError as mae:
+                    auth_error = mae
                 except Exception as e:
                     stats.images_failed += 1
                     Logger.error(f"Error inesperado al descargar imagen: {e}")
+            if auth_error:
+                raise auth_error
+            return results
+
+        if tasks:
+            results = _run_async(_run_all_images())
+        else:
+            results = []
 
         for image_url, (success, path, msg) in results:
             if success and path:
@@ -529,21 +557,36 @@ class CourseScraper:
 
             return success, path, msg, job
 
-        if workers > 1 and len(jobs) > 1:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(_run_job, j) for j in jobs]
-                for future in as_completed(futures):
-                    try:
-                        success, path, msg, job = future.result()
-                        self._handle_download_result(success, path, msg, job, stats)
-                    except MoodleAuthError:
-                        raise
-                    except Exception as e:
-                        Logger.error(f"Error inesperado en descarga concurrente: {e}")
-                        stats.files_failed += 1
-        else:
-            for job in jobs:
-                success, path, msg, job = _run_job(job)
+        limiter = AsyncLimiter(1, self.config.request_delay) if self.config.request_delay > 0 else None
+        sem = asyncio.Semaphore(workers)
+
+        async def _job_task(job: _DownloadJob):
+            async with sem:
+                if limiter:
+                    async with limiter:
+                        pass
+                return await asyncio.to_thread(_run_job, job)
+
+        async def _run_all_jobs():
+            results = []
+            auth_error = None
+            async with asyncio.TaskGroup() as tg:
+                job_handles = [tg.create_task(_job_task(j)) for j in jobs]
+            for h in job_handles:
+                try:
+                    results.append(h.result())
+                except MoodleAuthError as mae:
+                    auth_error = mae
+                except Exception as e:
+                    stats.files_failed += 1
+                    Logger.error(f"Error inesperado en descarga concurrente: {e}")
+            if auth_error:
+                raise auth_error
+            return results
+
+        if jobs:
+            results = _run_async(_run_all_jobs())
+            for success, path, msg, job in results:
                 self._handle_download_result(success, path, msg, job, stats)
 
         if manifest is not None:

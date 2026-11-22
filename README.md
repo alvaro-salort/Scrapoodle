@@ -11,20 +11,6 @@ Scrapoodle descarga los materiales de un curso de Moodle 4.x y los ordena en car
 - Python 3.10 o superior.
 - `pip install -r requirements.txt`.
 
-## Configuración
-
-Copiá `.env.example` a `.env`:
-
-```ini
-MOODLE_USER=tu_usuario
-MOODLE_PASSWORD=tu_contraseña
-MOODLE_BASE_URL=https://aulas.itu.uncu.edu.ar/itu/
-DOWNLOAD_DIR=./downloads
-MAX_WORKERS=3
-REQUEST_DELAY=0.0
-```
-
-Para SSO de Google o Microsoft, dejá el usuario vacío y usá `MOODLE_SESSION_COOKIE`, `--cookie -` o el prompt interactivo. La contraseña no se guarda en disco.
 
 ## Uso
 

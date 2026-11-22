@@ -58,7 +58,7 @@ downloads/
             └── archivo.pdf
 ```
 
-Cada curso guarda `manifest.json` con URL, ruta local, tamaño y SHA-256. `--verify` revalida los hashes. `--check-links` busca referencias rotas y genera `verificacion_enlaces.txt`.
+Cada curso guarda `manifest.json` con URL, ruta local, tamaño y SHA-256. Las imágenes embebidas se descargan en `imagenes/` y los Markdown las enlazan localmente. `--verify` revalida los hashes. `--check-links` busca referencias rotas y genera `verificacion_enlaces.txt`.
 
 ## Eventos y observadores
 
